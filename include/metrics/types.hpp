@@ -27,6 +27,7 @@ struct DiskMetrics {
 struct GpuMetrics {
   std::string name;
   std::string source;
+  std::optional<bool> in_use;
   std::optional<double> temperature_c;
   std::optional<double> core_clock_mhz;
   std::optional<double> utilization_percent;

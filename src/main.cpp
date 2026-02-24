@@ -82,6 +82,106 @@ std::string formatGpuVramUsage(const GpuMetrics& gpu) {
   return formatMibOrGib(gpu.memory_used_mib) + " / " + formatMibOrGib(gpu.memory_total_mib);
 }
 
+bool gpuHasTelemetry(const GpuMetrics& gpu) {
+  return gpu.temperature_c || gpu.core_clock_mhz || gpu.utilization_percent || gpu.power_w ||
+         gpu.memory_used_mib || gpu.memory_total_mib || gpu.memory_utilization_percent;
+}
+
+bool gpuLooksIntel(const GpuMetrics& gpu) {
+  const std::string lower_name = linux_utils::toLower(gpu.name);
+  const std::string lower_source = linux_utils::toLower(gpu.source);
+  return lower_name.find("intel") != std::string::npos || lower_source.find("intel") != std::string::npos ||
+         lower_source.find("i915") != std::string::npos || lower_source.find("xe") != std::string::npos;
+}
+
+bool gpuLooksRadeon(const GpuMetrics& gpu) {
+  const std::string lower_name = linux_utils::toLower(gpu.name);
+  const std::string lower_source = linux_utils::toLower(gpu.source);
+  return lower_source.find("radeon") != std::string::npos || lower_name.find("radeon") != std::string::npos;
+}
+
+bool anyGpuHasTelemetry(const std::vector<GpuMetrics>& gpus) {
+  return std::any_of(gpus.begin(), gpus.end(), [](const GpuMetrics& gpu) { return gpuHasTelemetry(gpu); });
+}
+
+bool gpuIsRelevantForSummary(const GpuMetrics& gpu) {
+  return gpuHasTelemetry(gpu) || (gpu.in_use && *gpu.in_use);
+}
+
+size_t pickDisplayGpuIndex(const std::vector<GpuMetrics>& gpus) {
+  if (gpus.empty()) {
+    return 0;
+  }
+
+  size_t first_with_telemetry = gpus.size();
+  size_t intel_with_telemetry = gpus.size();
+  size_t first_intel = gpus.size();
+
+  for (size_t i = 0; i < gpus.size(); ++i) {
+    const bool is_intel = gpuLooksIntel(gpus[i]);
+    if (is_intel && first_intel == gpus.size()) {
+      first_intel = i;
+    }
+
+    if (gpuHasTelemetry(gpus[i])) {
+      if (first_with_telemetry == gpus.size()) {
+        first_with_telemetry = i;
+      }
+      if (is_intel && intel_with_telemetry == gpus.size()) {
+        intel_with_telemetry = i;
+      }
+    }
+  }
+
+  if (gpuLooksRadeon(gpus.front()) && !gpuHasTelemetry(gpus.front())) {
+    if (intel_with_telemetry != gpus.size()) {
+      return intel_with_telemetry;
+    }
+    if (first_with_telemetry != gpus.size()) {
+      return first_with_telemetry;
+    }
+    if (first_intel != gpus.size()) {
+      return first_intel;
+    }
+  }
+
+  if (first_with_telemetry != gpus.size()) {
+    return first_with_telemetry;
+  }
+
+  return 0;
+}
+
+std::optional<size_t> pickInUseGpuIndex(const std::vector<GpuMetrics>& gpus) {
+  for (size_t i = 0; i < gpus.size(); ++i) {
+    if (gpus[i].in_use && *gpus[i].in_use) {
+      return i;
+    }
+  }
+
+  if (gpus.empty()) {
+    return std::nullopt;
+  }
+  return pickDisplayGpuIndex(gpus);
+}
+
+size_t countAdditionalRelevantGpus(const std::vector<GpuMetrics>& gpus, size_t selected_gpu_index) {
+  if (selected_gpu_index >= gpus.size()) {
+    return 0;
+  }
+
+  size_t count = 0;
+  for (size_t i = 0; i < gpus.size(); ++i) {
+    if (i == selected_gpu_index) {
+      continue;
+    }
+    if (gpuIsRelevantForSummary(gpus[i])) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 int colorPairForPercent(double percent) {
   if (percent >= 85.0) {
     return 3;
@@ -364,14 +464,14 @@ std::optional<double> computeGpuUsagePercent(const Snapshot& snapshot) {
   if (snapshot.gpus.empty()) {
     return std::nullopt;
   }
-  return snapshot.gpus.front().utilization_percent;
+  return snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)].utilization_percent;
 }
 
 std::optional<double> computeGpuVramUsagePercent(const Snapshot& snapshot) {
   if (snapshot.gpus.empty()) {
     return std::nullopt;
   }
-  const auto& gpu = snapshot.gpus.front();
+  const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
   if (gpu.memory_utilization_percent) {
     return gpu.memory_utilization_percent;
   }
@@ -689,8 +789,14 @@ int estimateGpuRows(const Snapshot& snapshot) {
   if (snapshot.gpus.empty()) {
     rows += 2;  // no-gpu message + tip
   } else {
+    if (!anyGpuHasTelemetry(snapshot.gpus)) {
+      rows += static_cast<int>(snapshot.gpus.size());  // Card 1, Card 2, ...
+      return rows;
+    }
+
+    const size_t display_gpu_index = pickDisplayGpuIndex(snapshot.gpus);
+    const GpuMetrics& gpu = snapshot.gpus[display_gpu_index];
     rows += 6;  // GPU base lines.
-    const GpuMetrics& gpu = snapshot.gpus.front();
     if (!gpu.memory_used_mib) {
       ++rows;
     }
@@ -700,7 +806,7 @@ int estimateGpuRows(const Snapshot& snapshot) {
     if (gpu.memory_utilization_percent) {
       ++rows;
     }
-    if (snapshot.gpus.size() > 1) {
+    if (countAdditionalRelevantGpus(snapshot.gpus, display_gpu_index) > 1) {
       ++rows;
     }
   }
@@ -790,8 +896,37 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
   int row = 1;
 
   if (!snapshot.gpus.empty()) {
-    const GpuMetrics& gpu = snapshot.gpus.front();
-    addWindowLine(panel, row++, "GPU: " + gpu.name + " [" + gpu.source + "]");
+    const size_t display_gpu_index = pickDisplayGpuIndex(snapshot.gpus);
+    const GpuMetrics& gpu = snapshot.gpus[display_gpu_index];
+    const auto in_use_gpu_index = pickInUseGpuIndex(snapshot.gpus);
+
+    if (!anyGpuHasTelemetry(snapshot.gpus)) {
+      size_t listed = 0;
+      for (size_t i = 0; i < snapshot.gpus.size() && row < getmaxy(panel) - 1; ++i) {
+        const GpuMetrics& item = snapshot.gpus[i];
+        std::string line = "Card " + std::to_string(i + 1) + ": " + item.name + " [" + item.source + "]";
+        if (in_use_gpu_index && *in_use_gpu_index == i) {
+          line += " (in use)";
+        }
+        addWindowLine(panel, row++, line);
+        ++listed;
+      }
+
+      if (listed < snapshot.gpus.size() && row < getmaxy(panel) - 1) {
+        const size_t remaining = snapshot.gpus.size() - listed;
+        if (remaining > 1) {
+          addWindowLine(panel, row++, "+" + std::to_string(remaining) + " more GPU(s)");
+        }
+      }
+      return;
+    }
+
+    std::string gpu_header = "GPU: " + gpu.name + " [" + gpu.source + "]";
+    if (in_use_gpu_index && *in_use_gpu_index == display_gpu_index) {
+      gpu_header += " (in use)";
+    }
+    addWindowLine(panel, row++, gpu_header);
+
     addWindowLine(panel, row++, "Temperature: " + formatOptional(gpu.temperature_c, " C", 1));
     addWindowLine(panel, row++, "Speed: " + formatOptional(gpu.core_clock_mhz, " MHz", 0));
     addWindowLine(panel, row++, "Usage: " + formatOptional(gpu.utilization_percent, "%", 0));
@@ -809,8 +944,9 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
       drawPipeBar(panel, row++, "VRAM", *gpu.memory_utilization_percent);
     }
 
-    if (snapshot.gpus.size() > 1 && row < getmaxy(panel) - 1) {
-      addWindowLine(panel, row++, "+" + std::to_string(snapshot.gpus.size() - 1) + " more GPU(s)");
+    const size_t extra_relevant_gpu_count = countAdditionalRelevantGpus(snapshot.gpus, display_gpu_index);
+    if (extra_relevant_gpu_count > 1 && row < getmaxy(panel) - 1) {
+      addWindowLine(panel, row++, "+" + std::to_string(extra_relevant_gpu_count) + " more GPU(s)");
     }
   } else {
     addWindowLine(panel, row++, "No GPU telemetry found");
