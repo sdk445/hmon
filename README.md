@@ -1,6 +1,7 @@
 # hmon CLI Monitor
 
 `hmon` is a Linux resource monitor.
+<img width="1898" height="977" alt="image" src="https://github.com/user-attachments/assets/95d98d9d-947c-4308-b7ed-67e3bec0dc9c" />
 
 - Disk space left
 - CPU temperature, speed, usage.
