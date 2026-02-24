@@ -1,6 +1,8 @@
-# hmon CLI
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/6e2a08b7-3c65-4700-a9db-e0d3580f8d41">
+</p>
+<h1 align="center">hmon is a Linux resource monitor.</h1>
 
-`hmon` is a Linux resource monitor.
 <img width="1898" height="977" alt="image" src="https://github.com/user-attachments/assets/95d98d9d-947c-4308-b7ed-67e3bec0dc9c" />
 <img width="1885" height="394" alt="image" src="https://github.com/user-attachments/assets/bd8c41fb-eb69-4f31-835f-05c8e0299ba4" />
 
