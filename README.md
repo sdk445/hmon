@@ -3,6 +3,15 @@
 </p>
 <h1 align="center">hmon is a Linux resource monitor.</h1>
 
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/1dc15b42-e694-4bcc-bd98-9ef2fd17d9d1"
+         controls
+         width="800">
+  </video>
+</p>
+
+
 <img width="1898" height="977" alt="image" src="https://github.com/user-attachments/assets/95d98d9d-947c-4308-b7ed-67e3bec0dc9c" />
 <img width="1885" height="394" alt="image" src="https://github.com/user-attachments/assets/bd8c41fb-eb69-4f31-835f-05c8e0299ba4" />
 
