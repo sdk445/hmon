@@ -231,58 +231,22 @@ void addColoredText(WINDOW* win, int row, int col, const std::string& text, int 
   }
 }
 
-void drawBar(WINDOW* win, int row, const std::string& label, double percent) {
+void drawPipeBar(WINDOW* win, int row, const std::string& label, double percent , int type = 0) {
   if (!win) {
     return;
   }
   const int max_y = getmaxy(win);
   const int max_x = getmaxx(win);
-  if (row <= 0 || row >= max_y - 1 || max_x < 24) {
-    addWindowLine(win, row, label + ": " + std::to_string(static_cast<int>(std::round(percent))) + "%");
+  std::string unit = (type > 0) ? "C" : "%";
+  if (row <= 0 || row >= max_y - 1 || max_x < 25) {
+    addWindowLine(win, row, label + ": " +
+    std::to_string(static_cast<int>(std::round(percent))) + unit);
     return;
   }
 
   const double clamped = std::max(0.0, std::min(100.0, percent));
-  const std::string prefix = label + " ";
-  const int pct_width = 5;
-  int bar_width = max_x - 4 - static_cast<int>(prefix.size()) - pct_width - 1;
-  if (bar_width < 8) {
-    bar_width = 8;
-  }
-
-  const int inner_width = bar_width - 2;
-  const int filled = static_cast<int>(std::round((clamped / 100.0) * inner_width));
-
-  mvwaddnstr(win, row, 2, prefix.c_str(), max_x - 4);
-  const int bar_start = 2 + static_cast<int>(prefix.size());
-
-  mvwaddch(win, row, bar_start, '[');
-  if (has_colors()) {
-    wattron(win, COLOR_PAIR(colorPairForPercent(clamped)));
-  }
-  for (int i = 0; i < inner_width; ++i) {
-    mvwaddch(win, row, bar_start + 1 + i, i < filled ? '#' : '-');
-  }
-  if (has_colors()) {
-    wattroff(win, COLOR_PAIR(colorPairForPercent(clamped)));
-  }
-  mvwaddch(win, row, bar_start + bar_width - 1, ']');
-  mvwprintw(win, row, bar_start + bar_width + 1, "%3d%%", static_cast<int>(std::round(clamped)));
-}
-
-void drawPipeBar(WINDOW* win, int row, const std::string& label, double percent) {
-  if (!win) {
-    return;
-  }
-  const int max_y = getmaxy(win);
-  const int max_x = getmaxx(win);
-  if (row <= 0 || row >= max_y - 1 || max_x < 24) {
-    addWindowLine(win, row, label + ": " + std::to_string(static_cast<int>(std::round(percent))) + "%");
-    return;
-  }
-
-  const double clamped = std::max(0.0, std::min(100.0, percent));
-  const std::string value_text = std::to_string(static_cast<int>(std::round(clamped))) + "%";
+  
+  const std::string value_text = std::to_string(static_cast<int>(std::round(clamped))) + unit;
   const std::string prefix = label + "[";
   const int suffix_width = static_cast<int>(value_text.size()) + 2;  // "] " + value
   int inner_width = max_x - 4 - static_cast<int>(prefix.size()) - suffix_width;
@@ -848,16 +812,21 @@ void renderCpuPanel(WINDOW* panel, const Snapshot& snapshot) {
   int row = 1;
   addWindowLine(panel, row++, "CPU: " + snapshot.cpu.name);
   addWindowLine(panel, row++, "Topology: " + formatCpuTopology(snapshot.cpu));
-  addWindowLine(panel, row++, "Temperature: " + formatOptional(snapshot.cpu.temperature_c, " C", 1));
   addWindowLine(panel, row++, "Speed: " + formatCpuFrequency(snapshot.cpu.frequency_mhz));
-  addWindowLine(panel, row++, "Usage: " + formatOptional(snapshot.cpu.usage_percent, "%", 0));
 
   if (snapshot.cpu.usage_percent && row < getmaxy(panel) - 1) {
     drawPipeBar(panel, row++, "Usage", *snapshot.cpu.usage_percent);
   }
   if (snapshot.cpu.temperature_c && row < getmaxy(panel) - 1) {
-    drawPipeBar(panel, row++, "Temp", *snapshot.cpu.temperature_c);
+    drawPipeBar(panel, row++, "Temp ", *snapshot.cpu.temperature_c , 1);
   }
+}
+
+void renderNetworkPanel(WINDOW* panel, const Snapshot& snapshot) {
+  if (!panel) {
+    return;
+  }
+  int row = 1;
 }
 
 void renderRamPanel(WINDOW* panel, const Snapshot& snapshot) {
@@ -904,7 +873,7 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
       size_t listed = 0;
       for (size_t i = 0; i < snapshot.gpus.size() && row < getmaxy(panel) - 1; ++i) {
         const GpuMetrics& item = snapshot.gpus[i];
-        std::string line = "Card " + std::to_string(i + 1) + ": " + item.name + " [" + item.source + "]";
+        std::string line = item.name + " [" + item.source + "]";
         if (in_use_gpu_index && *in_use_gpu_index == i) {
           line += " (in use)";
         }
@@ -1073,6 +1042,10 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   for (int x = 1; x < max_x - 1; ++x) {
     mvwaddch(panel, separator_row, x, ACS_HLINE);
   }
+  for (int x = 1; x < max_x - 1; ++x) {
+    mvwaddch(panel, table_top -2, x, ACS_HLINE);
+  }
+  
 
   int table_row = table_top;
   addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   COMMAND", 7);
@@ -1149,10 +1122,11 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   const Rect gpu_rect{top, x_right, gpu_h, right_w};
   const Rect disk_rect{top + gpu_h + gap, x_right, disk_h, right_w};
   const Rect history_rect{top + stack_h + gap, margin, history_h, cols - 2 * margin};
-
+  const Rect net_rect {top + ram_h + gap , x_left , ram_h , left_w};
   WINDOW* cpu_panel = createPanel(cpu_rect, "CPU");
   WINDOW* ram_panel = createPanel(ram_rect, "RAM");
   WINDOW* gpu_panel = createPanel(gpu_rect, "GPU");
+  WINDOW* net_panel = createPanel(net_rect , "NET");
   WINDOW* disk_panel = createPanel(disk_rect, "Disk");
   WINDOW* history_panel = has_history_panel ? createPanel(history_rect, "Activity") : nullptr;
 
