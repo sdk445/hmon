@@ -13,7 +13,8 @@
 
 
 <img width="1898" height="977" alt="image" src="https://github.com/user-attachments/assets/95d98d9d-947c-4308-b7ed-67e3bec0dc9c" />
-<img width="1885" height="394" alt="image" src="https://github.com/user-attachments/assets/bd8c41fb-eb69-4f31-835f-05c8e0299ba4" />
+<img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" />
+
 
 - Disk space left
 - CPU temperature, speed, usage.
