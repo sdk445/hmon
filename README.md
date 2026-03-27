@@ -12,7 +12,8 @@
 </p>
 
 
-<img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" />
+<!-- <img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" /> -->
+<img width="1919" height="1063" alt="image" src="https://github.com/user-attachments/assets/2882f417-b740-4905-8f6f-80dc18bb707f" />
 
 
 - Disk space left
