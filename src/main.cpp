@@ -317,6 +317,7 @@ struct ProcessInfo {
   int pid = 0;
   double cpu_percent = 0.0;
   double mem_percent = 0.0;
+  double gpu_percent = 0.0;
   std::string command;
 };
 
@@ -549,6 +550,28 @@ std::vector<ProcessInfo> collectTopProcesses(size_t limit) {
       process.command = "<unknown>";
     }
     processes.push_back(process);
+  }
+
+  const std::string gpu_output = linux_utils::runCommand(
+      "nvidia-smi pmon -c 1 2>/dev/null | tail -n +3 | awk '{print $2, $4}'");
+  std::istringstream gpu_stream(gpu_output);
+  std::string gpu_line;
+  while (std::getline(gpu_stream, gpu_line)) {
+    if (linux_utils::trim(gpu_line).empty()) {
+      continue;
+    }
+    std::istringstream gpu_iss(gpu_line);
+    int pid;
+    std::string sm_util;
+    if (gpu_iss >> pid >> sm_util && sm_util != "-") {
+      double gpu_util = std::stod(sm_util);
+      for (auto& proc : processes) {
+        if (proc.pid == pid) {
+          proc.gpu_percent = gpu_util;
+          break;
+        }
+      }
+    }
   }
 
   return processes;
@@ -1061,7 +1084,20 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   
 
   int table_row = table_top;
-  addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   COMMAND", 7);
+  bool show_gpu_col = false;
+  for (const auto& p : processes) {
+    if (p.gpu_percent > 0.0) {
+      show_gpu_col = true;
+      break;
+    }
+  }
+  
+  if (show_gpu_col) {
+    addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   GPU%   COMMAND", 7);
+  } else {
+    addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   COMMAND", 7);
+  }
+  
   const int max_entries = table_rows - 1;
   for (int i = 0; i < max_entries; ++i) {
     if (i >= static_cast<int>(processes.size())) {
@@ -1070,8 +1106,11 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
     const auto& process = processes[static_cast<size_t>(i)];
     std::ostringstream line;
     line << std::setw(6) << process.pid << " " << std::setw(6) << std::fixed << std::setprecision(1)
-         << process.cpu_percent << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent
-         << " " << process.command;
+         << process.cpu_percent << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent;
+    if (show_gpu_col) {
+      line << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.gpu_percent;
+    }
+    line << " " << process.command;
     addWindowLine(panel, table_row++, line.str());
   }
 }
