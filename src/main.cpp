@@ -1084,20 +1084,14 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   
 
   int table_row = table_top;
-  bool show_gpu_col = false;
-  for (const auto& p : processes) {
-    if (p.gpu_percent > 0.0) {
-      show_gpu_col = true;
-      break;
-    }
-  }
-  
+  bool show_gpu_col = true;
+
   if (show_gpu_col) {
-    addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   GPU%   COMMAND", 7);
+    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   GPU%   COMMAND", 7);
   } else {
-    addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   COMMAND", 7);
+    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   COMMAND", 7);
   }
-  
+
   const int max_entries = table_rows - 1;
   for (int i = 0; i < max_entries; ++i) {
     if (i >= static_cast<int>(processes.size())) {
