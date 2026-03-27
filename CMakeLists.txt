@@ -64,3 +64,10 @@ else()
     VERBATIM
   )
 endif()
+
+# Installation rules
+include(GNUInstallDirs)
+
+install(TARGETS hmon
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)

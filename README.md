@@ -65,6 +65,19 @@ cmake --build build -j
 ./build/hmon
 ```
 
+## Install
+
+```bash
+cmake --build build --target install
+```
+
+Or with a custom prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build --target install
+```
+
 ## Notes on telemetry sources
 
 - CPU temp: `/sys/class/thermal/*`
