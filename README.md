@@ -19,6 +19,7 @@
 - CPU temperature, speed, usage.
 - GPU temperature, speed, usage, wattage, and VRAM usage
 - RAM consumption
+- Network throughput  
 - DISK consumption
 - TOP processes
 
@@ -77,12 +78,26 @@ cmake --build build -j
 ./build/hmon
 ```
 
+## Install
+
+```bash
+cmake --build build --target install
+```
+
+Or with a custom prefix:
+
+```bash
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build --target install
+```
+
 ## Notes on telemetry sources
 
 - CPU temp: `/sys/class/thermal/*`
 - CPU speed: `/sys/devices/system/cpu/*/cpufreq` or `/proc/cpuinfo`
 - CPU usage: `/proc/stat` delta sampling
 - RAM: `/proc/meminfo`
+- Network: `/proc/net/dev` 
 - Disk: `statvfs("/")`
 - GPU:
   - Primary: `nvidia-smi` (temp, core clock, fan, utilization, power draw, memory used/total)

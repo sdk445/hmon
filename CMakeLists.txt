@@ -15,6 +15,7 @@ set(HMON_SOURCES
   src/metrics/gpu.cpp
   src/metrics/system.cpp
   src/metrics/sensors_fallback.cpp
+  src/metrics/network.cpp
 )
 
 set(CURSES_NEED_WIDE TRUE)
@@ -64,3 +65,10 @@ else()
     VERBATIM
   )
 endif()
+
+# Installation rules
+include(GNUInstallDirs)
+
+install(TARGETS hmon
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)

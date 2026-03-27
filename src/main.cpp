@@ -317,6 +317,7 @@ struct ProcessInfo {
   int pid = 0;
   double cpu_percent = 0.0;
   double mem_percent = 0.0;
+  double gpu_percent = 0.0;
   std::string command;
 };
 
@@ -549,6 +550,28 @@ std::vector<ProcessInfo> collectTopProcesses(size_t limit) {
       process.command = "<unknown>";
     }
     processes.push_back(process);
+  }
+
+  const std::string gpu_output = linux_utils::runCommand(
+      "nvidia-smi pmon -c 1 2>/dev/null | tail -n +3 | awk '{print $2, $4}'");
+  std::istringstream gpu_stream(gpu_output);
+  std::string gpu_line;
+  while (std::getline(gpu_stream, gpu_line)) {
+    if (linux_utils::trim(gpu_line).empty()) {
+      continue;
+    }
+    std::istringstream gpu_iss(gpu_line);
+    int pid;
+    std::string sm_util;
+    if (gpu_iss >> pid >> sm_util && sm_util != "-") {
+      double gpu_util = std::stod(sm_util);
+      for (auto& proc : processes) {
+        if (proc.pid == pid) {
+          proc.gpu_percent = gpu_util;
+          break;
+        }
+      }
+    }
   }
 
   return processes;
@@ -827,6 +850,16 @@ void renderNetworkPanel(WINDOW* panel, const Snapshot& snapshot) {
     return;
   }
   int row = 1;
+  
+  const auto& net = snapshot.network;
+  if (net.interface.empty()) {
+    addWindowLine(panel, row++, "N/A");
+    return;
+  }
+
+  addWindowLine(panel, row++, "Interface: " + net.interface);
+  addWindowLine(panel, row++, "Down: " + formatOptional(net.rx_kbps, " KB/s", 1));
+  addWindowLine(panel, row++, "Up: " + formatOptional(net.tx_kbps, " KB/s", 1));
 }
 
 void renderRamPanel(WINDOW* panel, const Snapshot& snapshot) {
@@ -890,7 +923,11 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
       return;
     }
 
-    std::string gpu_header = "GPU: " + gpu.name + " [" + gpu.source + "]";
+    std::string gpu_source = gpu.source;
+    if (gpu.source == "nvidia-smi") {
+      gpu_source = "CUDA";
+    }
+    std::string gpu_header = "GPU: " + gpu.name + " [" + gpu_source + "]";
     if (in_use_gpu_index && *in_use_gpu_index == display_gpu_index) {
       gpu_header += " (in use)";
     }
@@ -898,7 +935,6 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
 
     addWindowLine(panel, row++, "Temperature: " + formatOptional(gpu.temperature_c, " C", 1));
     addWindowLine(panel, row++, "Speed: " + formatOptional(gpu.core_clock_mhz, " MHz", 0));
-    addWindowLine(panel, row++, "Usage: " + formatOptional(gpu.utilization_percent, "%", 0));
     addWindowLine(panel, row++, "Power: " + formatOptional(gpu.power_w, " W", 1));
     addWindowLine(panel, row++, "VRAM: " + formatGpuVramUsage(gpu));
 
@@ -1048,7 +1084,14 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   
 
   int table_row = table_top;
-  addColoredText(panel, table_row++, 2, "PID    CPU%   MEM%   COMMAND", 7);
+  bool show_gpu_col = true;
+
+  if (show_gpu_col) {
+    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   GPU%   COMMAND", 7);
+  } else {
+    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   COMMAND", 7);
+  }
+
   const int max_entries = table_rows - 1;
   for (int i = 0; i < max_entries; ++i) {
     if (i >= static_cast<int>(processes.size())) {
@@ -1057,8 +1100,11 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
     const auto& process = processes[static_cast<size_t>(i)];
     std::ostringstream line;
     line << std::setw(6) << process.pid << " " << std::setw(6) << std::fixed << std::setprecision(1)
-         << process.cpu_percent << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent
-         << " " << process.command;
+         << process.cpu_percent << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent;
+    if (show_gpu_col) {
+      line << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.gpu_percent;
+    }
+    line << " " << process.command;
     addWindowLine(panel, table_row++, line.str());
   }
 }
@@ -1131,6 +1177,7 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   WINDOW* history_panel = has_history_panel ? createPanel(history_rect, "Activity") : nullptr;
 
   renderCpuPanel(cpu_panel, snapshot);
+  renderNetworkPanel(net_panel, snapshot);
   renderRamPanel(ram_panel, snapshot);
   renderGpuPanel(gpu_panel, snapshot);
   renderDiskPanel(disk_panel, snapshot);
@@ -1150,6 +1197,10 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     wnoutrefresh(gpu_panel);
     delwin(gpu_panel);
   }
+  if (net_panel) {
+    wnoutrefresh(net_panel);
+    delwin(net_panel);
+  }
   if (disk_panel) {
     wnoutrefresh(disk_panel);
     delwin(disk_panel);
@@ -1167,6 +1218,7 @@ Snapshot collectSnapshot() {
   snapshot.cpu = collectCpuMetrics();
   snapshot.ram = collectRam();
   snapshot.disk = collectDisk("/");
+  snapshot.network = collectNetwork();
   snapshot.gpus = collectGpus();
   return snapshot;
 }

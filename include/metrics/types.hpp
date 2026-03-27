@@ -37,9 +37,16 @@ struct GpuMetrics {
   std::optional<double> memory_utilization_percent;
 };
 
+struct NetworkMetrics {
+  std::string interface;
+  std::optional<double> rx_kbps;
+  std::optional<double> tx_kbps;
+};
+
 struct Snapshot {
   CpuMetrics cpu;
   RamMetrics ram;
   DiskMetrics disk;
+  NetworkMetrics network;
   std::vector<GpuMetrics> gpus;
 };
