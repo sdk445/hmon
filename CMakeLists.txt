@@ -15,6 +15,7 @@ set(HMON_SOURCES
   src/metrics/gpu.cpp
   src/metrics/system.cpp
   src/metrics/sensors_fallback.cpp
+  src/metrics/network.cpp
 )
 
 set(CURSES_NEED_WIDE TRUE)

@@ -827,6 +827,16 @@ void renderNetworkPanel(WINDOW* panel, const Snapshot& snapshot) {
     return;
   }
   int row = 1;
+  
+  const auto& net = snapshot.network;
+  if (net.interface.empty()) {
+    addWindowLine(panel, row++, "N/A");
+    return;
+  }
+
+  addWindowLine(panel, row++, "Interface: " + net.interface);
+  addWindowLine(panel, row++, "Down: " + formatOptional(net.rx_kbps, " KB/s", 1));
+  addWindowLine(panel, row++, "Up: " + formatOptional(net.tx_kbps, " KB/s", 1));
 }
 
 void renderRamPanel(WINDOW* panel, const Snapshot& snapshot) {
@@ -890,7 +900,11 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
       return;
     }
 
-    std::string gpu_header = "GPU: " + gpu.name + " [" + gpu.source + "]";
+    std::string gpu_source = gpu.source;
+    if (gpu.source == "nvidia-smi") {
+      gpu_source = "CUDA";
+    }
+    std::string gpu_header = "GPU: " + gpu.name + " [" + gpu_source + "]";
     if (in_use_gpu_index && *in_use_gpu_index == display_gpu_index) {
       gpu_header += " (in use)";
     }
@@ -898,7 +912,6 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
 
     addWindowLine(panel, row++, "Temperature: " + formatOptional(gpu.temperature_c, " C", 1));
     addWindowLine(panel, row++, "Speed: " + formatOptional(gpu.core_clock_mhz, " MHz", 0));
-    addWindowLine(panel, row++, "Usage: " + formatOptional(gpu.utilization_percent, "%", 0));
     addWindowLine(panel, row++, "Power: " + formatOptional(gpu.power_w, " W", 1));
     addWindowLine(panel, row++, "VRAM: " + formatGpuVramUsage(gpu));
 
@@ -1131,6 +1144,7 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   WINDOW* history_panel = has_history_panel ? createPanel(history_rect, "Activity") : nullptr;
 
   renderCpuPanel(cpu_panel, snapshot);
+  renderNetworkPanel(net_panel, snapshot);
   renderRamPanel(ram_panel, snapshot);
   renderGpuPanel(gpu_panel, snapshot);
   renderDiskPanel(disk_panel, snapshot);
@@ -1150,6 +1164,10 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     wnoutrefresh(gpu_panel);
     delwin(gpu_panel);
   }
+  if (net_panel) {
+    wnoutrefresh(net_panel);
+    delwin(net_panel);
+  }
   if (disk_panel) {
     wnoutrefresh(disk_panel);
     delwin(disk_panel);
@@ -1167,6 +1185,7 @@ Snapshot collectSnapshot() {
   snapshot.cpu = collectCpuMetrics();
   snapshot.ram = collectRam();
   snapshot.disk = collectDisk("/");
+  snapshot.network = collectNetwork();
   snapshot.gpus = collectGpus();
   return snapshot;
 }

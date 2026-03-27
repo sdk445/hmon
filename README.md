@@ -1,12 +1,25 @@
-# hmon CLI
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/6e2a08b7-3c65-4700-a9db-e0d3580f8d41">
+</p>
+<h1 align="center">hmon is a Linux resource monitor.</h1>
 
-`hmon` is a Linux resource monitor.
-<img width="1898" height="977" alt="image" src="https://github.com/user-attachments/assets/95d98d9d-947c-4308-b7ed-67e3bec0dc9c" />
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/1dc15b42-e694-4bcc-bd98-9ef2fd17d9d1"
+         controls
+         width="800">
+  </video>
+</p>
+
+
+<img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" />
+
 
 - Disk space left
 - CPU temperature, speed, usage.
 - GPU temperature, speed, usage, wattage, and VRAM usage
 - RAM consumption
+- Network throughput  
 - DISK consumption
 - TOP processes
 
@@ -84,6 +97,7 @@ cmake --build build --target install
 - CPU speed: `/sys/devices/system/cpu/*/cpufreq` or `/proc/cpuinfo`
 - CPU usage: `/proc/stat` delta sampling
 - RAM: `/proc/meminfo`
+- Network: `/proc/net/dev` 
 - Disk: `statvfs("/")`
 - GPU:
   - Primary: `nvidia-smi` (temp, core clock, fan, utilization, power draw, memory used/total)

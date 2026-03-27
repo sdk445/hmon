@@ -6,6 +6,7 @@
 
 RamMetrics collectRam();
 DiskMetrics collectDisk(const std::string& mount_point = "/");
+NetworkMetrics collectNetwork();
 
 std::string currentTimestamp();
 std::string hostName();
