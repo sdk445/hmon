@@ -91,6 +91,7 @@ Or with a custom prefix:
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
 cmake --build build --target install
 ```
+[![Buy Me a Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=sdk445&button_colour=FFDD00&font_colour=000000&font_family=Lato&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/sdk445)
 
 ## Notes on telemetry sources
 
@@ -103,3 +104,5 @@ cmake --build build --target install
 - GPU:
   - Primary: `nvidia-smi` (temp, core clock, fan, utilization, power draw, memory used/total)
   - Fallback: `/sys/class/drm/*/device` + hwmon + `sensors` command
+
+
