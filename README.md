@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/6e2a08b7-3c65-4700-a9db-e0d3580f8d41">
+  <img width="1095" height="577" alt="image" src="https://github.com/user-attachments/assets/95d62f59-1005-4cbd-86e8-d0b0494a341c" />
 </p>
 <h1 align="center">hmon is a Linux resource monitor.</h1>
 
