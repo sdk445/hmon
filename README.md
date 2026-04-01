@@ -11,9 +11,13 @@
   </video>
 </p> -->
 
-
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/66df0127-5ca5-40cd-93cd-bbe13564e775" />
+<img width="1920" height="501" alt="image" src="https://github.com/user-attachments/assets/b0856fc4-c843-43e3-b7ff-fed334a98c3a" />
+<p align="center">
+<img width="861" height="434" alt="572344879-dbe92899-322b-4f08-9847-12797d811721 (1)" src="https://github.com/user-attachments/assets/e1bdbc3f-5deb-4bd7-bdaf-724daad46a44" />
+</p>
 <!-- <img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" /> -->
-<img width="1919" height="1063" alt="image" src="https://github.com/user-attachments/assets/2882f417-b740-4905-8f6f-80dc18bb707f" />
+<!-- <img width="1919" height="1063" alt="image" src="https://github.com/user-attachments/assets/2882f417-b740-4905-8f6f-80dc18bb707f" /> -->
 
 
 - Disk space left
