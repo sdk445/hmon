@@ -12,6 +12,36 @@
 #include <sstream>
 #include <string>
 
+std::optional<double> getSwapUsagePercent() {
+  std::ifstream meminfo("/proc/meminfo");
+  if (!meminfo) {
+    return std::nullopt;
+  }
+
+  std::string key;
+  long long value = 0;
+  std::string unit;
+  
+  std::optional<long long> swap_total;
+  std::optional<long long> swap_free;
+
+  while (meminfo >> key >> value >> unit) {
+    if (key == "SwapTotal:") {
+      swap_total = value;
+    } else if (key == "SwapFree:") {
+      swap_free = value;
+    }
+  }
+
+  if (!swap_total || !swap_free || *swap_total <= 0) {
+    return std::nullopt;
+  }
+
+  long long used = *swap_total - *swap_free;
+  double pct = 100.0 * static_cast<double>(used) / static_cast<double>(*swap_total);
+  return std::max(0.0, std::min(100.0, pct));
+}
+
 RamMetrics collectRam() {
   RamMetrics metrics;
   std::ifstream meminfo("/proc/meminfo");

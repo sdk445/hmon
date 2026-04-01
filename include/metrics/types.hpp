@@ -11,6 +11,7 @@ struct CpuMetrics {
   std::optional<double> temperature_c;
   std::optional<double> frequency_mhz;
   std::optional<double> usage_percent;
+  std::vector<double> core_usage_percent;
 };
 
 struct RamMetrics {
@@ -35,6 +36,7 @@ struct GpuMetrics {
   std::optional<double> memory_used_mib;
   std::optional<double> memory_total_mib;
   std::optional<double> memory_utilization_percent;
+  std::vector<double> gpu_core_usage_percent;
 };
 
 struct NetworkMetrics {
@@ -43,10 +45,20 @@ struct NetworkMetrics {
   std::optional<double> tx_kbps;
 };
 
+struct ProcessInfo {
+  int pid = 0;
+  std::string name;
+  double cpu_percent = 0.0;
+  double mem_percent = 0.0;
+  double gpu_percent = 0.0;
+  std::string command;
+};
+
 struct Snapshot {
   CpuMetrics cpu;
   RamMetrics ram;
   DiskMetrics disk;
   NetworkMetrics network;
   std::vector<GpuMetrics> gpus;
+  std::vector<ProcessInfo> processes;
 };

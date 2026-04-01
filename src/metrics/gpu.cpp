@@ -156,11 +156,35 @@ std::optional<double> readActiveAmdClockMhz(const fs::path& pp_dpm_sclk_file) {
   return std::nullopt;
 }
 
+std::vector<double> collectAmdGpuCoreUsage(const fs::path& device_path) {
+  std::vector<double> core_usage;
+  
+  const fs::path gpu_busy_file = device_path / "gpu_busy_percent";
+  const auto gpu_busy = linux_utils::readLongLong(gpu_busy_file);
+  if (gpu_busy) {
+    auto normalized = linux_utils::normalizePercent(*gpu_busy);
+    if (normalized) {
+      core_usage.push_back(*normalized);
+    }
+  }
+  
+  const fs::path mem_busy_file = device_path / "mem_busy_percent";
+  const auto mem_busy = linux_utils::readLongLong(mem_busy_file);
+  if (mem_busy) {
+    auto normalized = linux_utils::normalizePercent(*mem_busy);
+    if (normalized) {
+      core_usage.push_back(*normalized);
+    }
+  }
+  
+  return core_usage;
+}
+
 std::vector<GpuMetrics> collectGpusFromNvidiaSmi() {
   std::vector<GpuMetrics> gpus;
   const std::string command =
       "nvidia-smi --query-gpu=name,temperature.gpu,clocks.sm,utilization.gpu,power.draw,"
-      "memory.used,memory.total "
+      "memory.used,memory.total,memory.free,utilization.memory "
       "--format=csv,noheader,nounits 2>/dev/null";
   const std::string output = linux_utils::runCommand(command);
   if (linux_utils::trim(output).empty()) {
@@ -175,7 +199,7 @@ std::vector<GpuMetrics> collectGpusFromNvidiaSmi() {
     }
 
     auto fields = linux_utils::splitByChar(line, ',');
-    if (fields.size() < 7) {
+    if (fields.size() < 9) {
       continue;
     }
 
@@ -188,9 +212,21 @@ std::vector<GpuMetrics> collectGpusFromNvidiaSmi() {
     gpu.power_w = linux_utils::parseOptionalDouble(fields[4]);
     gpu.memory_used_mib = linux_utils::parseOptionalDouble(fields[5]);
     gpu.memory_total_mib = linux_utils::parseOptionalDouble(fields[6]);
+    
     if (gpu.memory_used_mib && gpu.memory_total_mib && *gpu.memory_total_mib > 0.0) {
       gpu.memory_utilization_percent = 100.0 * (*gpu.memory_used_mib) / (*gpu.memory_total_mib);
     }
+    
+    auto mem_util = linux_utils::parseOptionalDouble(fields[8]);
+    if (mem_util) {
+      gpu.memory_utilization_percent = mem_util;
+    }
+    
+    gpu.gpu_core_usage_percent = {gpu.utilization_percent.value_or(0.0)};
+    if (gpu.memory_utilization_percent) {
+      gpu.gpu_core_usage_percent.push_back(*gpu.memory_utilization_percent);
+    }
+    
     gpus.push_back(gpu);
   }
 
@@ -258,6 +294,8 @@ std::vector<GpuMetrics> collectGpusFromSysfs() {
     if (const auto raw_util = linux_utils::readLongLong(device_path / "gpu_busy_percent"); raw_util) {
       gpu.utilization_percent = linux_utils::normalizePercent(*raw_util);
     }
+    
+    gpu.gpu_core_usage_percent = collectAmdGpuCoreUsage(device_path);
 
     const auto vram_used_bytes =
         linux_utils::readFirstExistingLongLong({device_path / "mem_info_vram_used", device_path / "mem_info_vis_vram_used"});

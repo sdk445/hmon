@@ -1,6 +1,4 @@
 #include <ncurses.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
 
 #include <algorithm>
 #include <chrono>
@@ -8,20 +6,73 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/mach_init.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/mount.h>
+#else
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+#include <sys/statvfs.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+
+#include "metrics/types.hpp"
+#include "metrics/version.hpp"
+
+#ifdef __APPLE__
+#include "metrics/cpu_darwin.hpp"
+#include "metrics/gpu_darwin.hpp"
+#include "metrics/system_darwin.hpp"
+#else
 #include "metrics/cpu.hpp"
 #include "metrics/gpu.hpp"
-#include "metrics/linux_utils.hpp"
 #include "metrics/system.hpp"
-#include "metrics/types.hpp"
+#endif
+
+enum class SortMode { kCpu, kMem, kGpu, kPid };
+
+struct Config {
+  int refresh_interval_ms = 1000;
+  size_t top_processes = 8;
+  size_t history_points = 2048;
+  bool show_gpu = true;
+  bool show_history = true;
+  bool zen_mode = false;
+  int lock_pid = -1;
+  int selected_pid = -1;
+  SortMode sort_mode = SortMode::kCpu;
+  bool show_colors = true;
+  bool show_help = false;
+  bool show_version = false;
+  bool show_selection_highlight = false;
+  std::optional<std::string> cli_error;
+};
 
 struct Rect {
   int y;
@@ -29,6 +80,151 @@ struct Rect {
   int h;
   int w;
 };
+
+struct MetricsHistory {
+  std::vector<double> cpu_usage;
+  std::vector<double> cpu_temp;
+  std::vector<double> ram_usage;
+  std::vector<double> gpu_usage;
+  std::vector<double> gpu_vram_usage;
+  std::vector<double> disk_usage;
+};
+
+struct BrailleCanvas {
+  int width = 0;
+  int height = 0;
+  std::vector<uint16_t> cells;
+};
+
+constexpr uint16_t kDirUp = 0x01;
+constexpr uint16_t kDirDown = 0x02;
+constexpr uint16_t kDirLeft = 0x04;
+constexpr uint16_t kDirRight = 0x08;
+constexpr uint16_t kDirPoint = 0x10;
+
+void printHelp(const char* program_name) {
+  std::cout << "hmon " << version::kCurrent << "\n\n";
+  std::cout << "Usage: " << program_name << " [OPTIONS]\n\n";
+  std::cout << "Options:\n";
+  std::cout << "  -h, --help              Show this help and exit\n";
+  std::cout << "  -v, --version           Show version and exit\n";
+  std::cout << "  -r, --refresh <secs>    Refresh interval in seconds (1-60, default: 1)\n";
+  std::cout << "  -t, --top <count>       Number of processes to show (1-20, default: 8)\n";
+  std::cout << "  --no-gpu                Disable GPU\n";
+  std::cout << "  --no-history            Disable history\n";
+  std::cout << "  --zen                   Zen mode\n";
+  std::cout << "  --pid <id>              Focus on a specific PID\n";
+  std::cout << "  --no-color              Disable colors\n\n";
+  std::cout << "Controls:\n";
+  std::cout << "  q       Quit    ?       Help    z       Zen mode\n";
+  std::cout << "  s       Sort    l       Lock    u       Unlock\n";
+  std::cout << "  r       Refresh +/-     Speed\n";
+}
+
+void printVersion() {
+  std::cout << "hmon " << version::kCurrent << "\n";
+}
+
+bool parseIntArg(const char* value, int min, int max, int* out) {
+  if (!value || !out) {
+    return false;
+  }
+  try {
+    const int parsed = std::stoi(value);
+    if (parsed < min || parsed > max) {
+      return false;
+    }
+    *out = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+Config parseArgs(int argc, char* argv[]) {
+  Config config;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+
+    if (arg == "-h" || arg == "--help") {
+      config.show_help = true;
+      return config;
+    }
+
+    if (arg == "-v" || arg == "--version") {
+      config.show_version = true;
+      return config;
+    }
+
+    if (arg == "-r" || arg == "--refresh") {
+      if (i + 1 >= argc) {
+        config.cli_error = "--refresh requires a value between 1 and 60.";
+        return config;
+      }
+      int secs = 0;
+      if (!parseIntArg(argv[++i], 1, 60, &secs)) {
+        config.cli_error = "Invalid refresh interval. Use a value between 1 and 60 seconds.";
+        return config;
+      }
+      config.refresh_interval_ms = secs * 1000;
+      continue;
+    }
+
+    if (arg == "-t" || arg == "--top") {
+      if (i + 1 >= argc) {
+        config.cli_error = "--top requires a value between 1 and 20.";
+        return config;
+      }
+      int count = 0;
+      if (!parseIntArg(argv[++i], 1, 20, &count)) {
+        config.cli_error = "Invalid top count. Use a value between 1 and 20.";
+        return config;
+      }
+      config.top_processes = static_cast<size_t>(count);
+      continue;
+    }
+
+    if (arg == "--no-gpu") {
+      config.show_gpu = false;
+      continue;
+    }
+
+    if (arg == "--no-history") {
+      config.show_history = false;
+      continue;
+    }
+
+    if (arg == "--zen") {
+      config.zen_mode = true;
+      continue;
+    }
+
+    if (arg == "--pid") {
+      if (i + 1 >= argc) {
+        config.cli_error = "--pid requires a positive process id.";
+        return config;
+      }
+      int pid = 0;
+      if (!parseIntArg(argv[++i], 1, std::numeric_limits<int>::max(), &pid)) {
+        config.cli_error = "Invalid PID. Use a positive integer.";
+        return config;
+      }
+      config.lock_pid = pid;
+      continue;
+    }
+
+    if (arg == "--no-color") {
+      config.show_colors = false;
+      continue;
+    }
+
+    config.cli_error = "Unknown option: " + arg;
+    return config;
+  }
+
+  return config;
+}
 
 std::string formatOptional(const std::optional<double>& value, const std::string& unit,
                            int precision = 1) {
@@ -82,73 +278,72 @@ std::string formatGpuVramUsage(const GpuMetrics& gpu) {
   return formatMibOrGib(gpu.memory_used_mib) + " / " + formatMibOrGib(gpu.memory_total_mib);
 }
 
+bool processListContainsPid(const std::vector<ProcessInfo>& processes, int pid) {
+  if (pid <= 0) {
+    return false;
+  }
+  return std::any_of(processes.begin(), processes.end(),
+                     [pid](const ProcessInfo& process) { return process.pid == pid; });
+}
+
+int selectedProcessIndex(const std::vector<ProcessInfo>& processes, int selected_pid) {
+  if (processes.empty()) {
+    return -1;
+  }
+  for (size_t i = 0; i < processes.size(); ++i) {
+    if (processes[i].pid == selected_pid) {
+      return static_cast<int>(i);
+    }
+  }
+  return 0;
+}
+
+void syncSelection(const std::vector<ProcessInfo>& processes, Config* config) {
+  if (!config) {
+    return;
+  }
+  if (processes.empty()) {
+    config->selected_pid = -1;
+    return;
+  }
+  if (processListContainsPid(processes, config->selected_pid)) {
+    return;
+  }
+  if (processListContainsPid(processes, config->lock_pid)) {
+    config->selected_pid = config->lock_pid;
+    return;
+  }
+  config->selected_pid = processes.front().pid;
+}
+
+void moveSelection(const std::vector<ProcessInfo>& processes, Config* config, int delta) {
+  if (!config || processes.empty()) {
+    return;
+  }
+  const int current_index = selectedProcessIndex(processes, config->selected_pid);
+  const int next_index =
+      std::max(0, std::min(static_cast<int>(processes.size()) - 1, current_index + delta));
+  config->selected_pid = processes[static_cast<size_t>(next_index)].pid;
+}
+
 bool gpuHasTelemetry(const GpuMetrics& gpu) {
   return gpu.temperature_c || gpu.core_clock_mhz || gpu.utilization_percent || gpu.power_w ||
          gpu.memory_used_mib || gpu.memory_total_mib || gpu.memory_utilization_percent;
-}
-
-bool gpuLooksIntel(const GpuMetrics& gpu) {
-  const std::string lower_name = linux_utils::toLower(gpu.name);
-  const std::string lower_source = linux_utils::toLower(gpu.source);
-  return lower_name.find("intel") != std::string::npos || lower_source.find("intel") != std::string::npos ||
-         lower_source.find("i915") != std::string::npos || lower_source.find("xe") != std::string::npos;
-}
-
-bool gpuLooksRadeon(const GpuMetrics& gpu) {
-  const std::string lower_name = linux_utils::toLower(gpu.name);
-  const std::string lower_source = linux_utils::toLower(gpu.source);
-  return lower_source.find("radeon") != std::string::npos || lower_name.find("radeon") != std::string::npos;
 }
 
 bool anyGpuHasTelemetry(const std::vector<GpuMetrics>& gpus) {
   return std::any_of(gpus.begin(), gpus.end(), [](const GpuMetrics& gpu) { return gpuHasTelemetry(gpu); });
 }
 
-bool gpuIsRelevantForSummary(const GpuMetrics& gpu) {
-  return gpuHasTelemetry(gpu) || (gpu.in_use && *gpu.in_use);
-}
-
 size_t pickDisplayGpuIndex(const std::vector<GpuMetrics>& gpus) {
   if (gpus.empty()) {
     return 0;
   }
-
-  size_t first_with_telemetry = gpus.size();
-  size_t intel_with_telemetry = gpus.size();
-  size_t first_intel = gpus.size();
-
   for (size_t i = 0; i < gpus.size(); ++i) {
-    const bool is_intel = gpuLooksIntel(gpus[i]);
-    if (is_intel && first_intel == gpus.size()) {
-      first_intel = i;
-    }
-
     if (gpuHasTelemetry(gpus[i])) {
-      if (first_with_telemetry == gpus.size()) {
-        first_with_telemetry = i;
-      }
-      if (is_intel && intel_with_telemetry == gpus.size()) {
-        intel_with_telemetry = i;
-      }
+      return i;
     }
   }
-
-  if (gpuLooksRadeon(gpus.front()) && !gpuHasTelemetry(gpus.front())) {
-    if (intel_with_telemetry != gpus.size()) {
-      return intel_with_telemetry;
-    }
-    if (first_with_telemetry != gpus.size()) {
-      return first_with_telemetry;
-    }
-    if (first_intel != gpus.size()) {
-      return first_intel;
-    }
-  }
-
-  if (first_with_telemetry != gpus.size()) {
-    return first_with_telemetry;
-  }
-
   return 0;
 }
 
@@ -158,28 +353,10 @@ std::optional<size_t> pickInUseGpuIndex(const std::vector<GpuMetrics>& gpus) {
       return i;
     }
   }
-
   if (gpus.empty()) {
     return std::nullopt;
   }
   return pickDisplayGpuIndex(gpus);
-}
-
-size_t countAdditionalRelevantGpus(const std::vector<GpuMetrics>& gpus, size_t selected_gpu_index) {
-  if (selected_gpu_index >= gpus.size()) {
-    return 0;
-  }
-
-  size_t count = 0;
-  for (size_t i = 0; i < gpus.size(); ++i) {
-    if (i == selected_gpu_index) {
-      continue;
-    }
-    if (gpuIsRelevantForSummary(gpus[i])) {
-      ++count;
-    }
-  }
-  return count;
 }
 
 int colorPairForPercent(double percent) {
@@ -190,14 +367,6 @@ int colorPairForPercent(double percent) {
     return 2;
   }
   return 1;
-}
-
-int colorPairForBarFillPosition(int filled_index, int filled_count) {
-  if (filled_count <= 0) {
-    return 1;
-  }
-  const double progress = 100.0 * static_cast<double>(filled_index + 1) / static_cast<double>(filled_count);
-  return colorPairForPercent(progress);
 }
 
 void addWindowLine(WINDOW* win, int row, const std::string& text) {
@@ -231,13 +400,40 @@ void addColoredText(WINDOW* win, int row, int col, const std::string& text, int 
   }
 }
 
-void drawPipeBar(WINDOW* win, int row, const std::string& label, double percent , int type = 0) {
+void drawMiniBar(WINDOW* win, int row, int col, double percent, int width) {
+  if (!win || width < 1) return;
+  
+  const double clamped = std::max(0.0, std::min(100.0, percent));
+  const int filled = static_cast<int>(std::round((clamped / 100.0) * static_cast<double>(width)));
+  const int color = colorPairForPercent(clamped);
+  
+  if (has_colors()) {
+    wattron(win, COLOR_PAIR(color));
+  }
+  wattron(win, A_BOLD);
+  
+  for (int i = 0; i < width; i++) {
+    if (i < filled) {
+      mvwaddch(win, row, col + i, ACS_CKBOARD);
+    } else {
+      mvwaddch(win, row, col + i, ' ');
+    }
+  }
+  
+  wattroff(win, A_BOLD);
+  if (has_colors()) {
+    wattroff(win, COLOR_PAIR(color));
+  }
+}
+
+void drawBar(WINDOW* win, int row, const std::string& label, double percent, int type = 0) {
   if (!win) {
     return;
   }
   const int max_y = getmaxy(win);
   const int max_x = getmaxx(win);
   std::string unit = (type > 0) ? "C" : "%";
+  
   if (row <= 0 || row >= max_y - 1 || max_x < 25) {
     addWindowLine(win, row, label + ": " +
     std::to_string(static_cast<int>(std::round(percent))) + unit);
@@ -245,11 +441,10 @@ void drawPipeBar(WINDOW* win, int row, const std::string& label, double percent 
   }
 
   const double clamped = std::max(0.0, std::min(100.0, percent));
-  
   const std::string value_text = std::to_string(static_cast<int>(std::round(clamped))) + unit;
-  const std::string prefix = label + "[";
-  const int suffix_width = static_cast<int>(value_text.size()) + 2;  // "] " + value
-  int inner_width = max_x - 4 - static_cast<int>(prefix.size()) - suffix_width;
+  const std::string prefix = label;
+  const int suffix_width = static_cast<int>(value_text.size()) + 1;
+  int inner_width = max_x - 4 - static_cast<int>(prefix.size()) - suffix_width - 3;
   if (inner_width < 8) {
     inner_width = 8;
   }
@@ -257,41 +452,35 @@ void drawPipeBar(WINDOW* win, int row, const std::string& label, double percent 
 
   const int start_col = 2;
   mvwaddnstr(win, row, start_col, prefix.c_str(), max_x - 4);
-  const int bar_col = start_col + static_cast<int>(prefix.size());
-  const int capped_filled = std::max(0, std::min(inner_width, filled));
+  mvwaddch(win, row, start_col + static_cast<int>(prefix.size()), '[');
+  const int bar_col = start_col + static_cast<int>(prefix.size()) + 1;
 
+  wattron(win, A_BOLD);
   for (int i = 0; i < inner_width; ++i) {
-    if (i < capped_filled) {
+    if (i < filled) {
       if (has_colors()) {
-        wattron(win, COLOR_PAIR(colorPairForBarFillPosition(i, capped_filled)));
+        wattron(win, COLOR_PAIR(colorPairForPercent(clamped)));
       }
-      wattron(win, A_DIM);
-      mvwaddch(win, row, bar_col + i, '|');
-      wattroff(win, A_DIM);
+      mvwaddch(win, row, bar_col + i, ACS_CKBOARD);
       if (has_colors()) {
-        wattroff(win, COLOR_PAIR(colorPairForBarFillPosition(i, capped_filled)));
+        wattroff(win, COLOR_PAIR(colorPairForPercent(clamped)));
       }
     } else {
-      if (has_colors()) {
-        wattron(win, COLOR_PAIR(7));
-      }
-      wattron(win, A_DIM);
       mvwaddch(win, row, bar_col + i, ' ');
-      wattroff(win, A_DIM);
-      if (has_colors()) {
-        wattroff(win, COLOR_PAIR(7));
-      }
     }
   }
+  wattroff(win, A_BOLD);
 
   mvwaddch(win, row, bar_col + inner_width, ']');
+  wattron(win, A_BOLD);
   if (has_colors()) {
-    wattron(win, COLOR_PAIR(2));
+    wattron(win, COLOR_PAIR(4));
   }
   mvwaddnstr(win, row, bar_col + inner_width + 1, (" " + value_text).c_str(), max_x - 2 - (bar_col + inner_width + 1));
   if (has_colors()) {
-    wattroff(win, COLOR_PAIR(2));
+    wattroff(win, COLOR_PAIR(4));
   }
+  wattroff(win, A_BOLD);
 }
 
 WINDOW* createPanel(const Rect& rect, const std::string& title) {
@@ -299,282 +488,19 @@ WINDOW* createPanel(const Rect& rect, const std::string& title) {
     return nullptr;
   }
   WINDOW* panel = newwin(rect.h, rect.w, rect.y, rect.x);
-  box(panel, 0, 0);
+  
+  if (has_colors()) {
+    wattron(panel, COLOR_PAIR(4));
+    wattron(panel, A_BOLD);
+  }
+  box(panel, ACS_VLINE, ACS_HLINE);
+  if (has_colors()) {
+    wattroff(panel, COLOR_PAIR(4));
+    wattroff(panel, A_BOLD);
+  }
+  
   mvwprintw(panel, 0, 2, " %s ", title.c_str());
   return panel;
-}
-
-struct MetricsHistory {
-  std::vector<double> cpu_usage;
-  std::vector<double> cpu_temp;
-  std::vector<double> ram_usage;
-  std::vector<double> gpu_usage;
-  std::vector<double> gpu_vram_usage;
-  std::vector<double> disk_usage;
-};
-
-struct ProcessInfo {
-  int pid = 0;
-  double cpu_percent = 0.0;
-  double mem_percent = 0.0;
-  double gpu_percent = 0.0;
-  std::string command;
-};
-
-struct BrailleCanvas {
-  int width = 0;   // terminal cells (x)
-  int height = 0;  // terminal cells (y)
-  std::vector<uint16_t> cells;  // dot masks, size = width * height
-};
-
-constexpr int kTargetFps = 1;
-constexpr int kFrameIntervalMs = 1000 / kTargetFps;
-constexpr uint16_t kDirUp = 0x01;
-constexpr uint16_t kDirDown = 0x02;
-constexpr uint16_t kDirLeft = 0x04;
-constexpr uint16_t kDirRight = 0x08;
-constexpr uint16_t kDirPoint = 0x10;
-
-double clampPercent(double value) {
-  return std::max(0.0, std::min(100.0, value));
-}
-
-std::optional<std::pair<unsigned int, unsigned int>> rootDeviceNumbers() {
-  struct stat stat_info {};
-  if (stat("/", &stat_info) != 0) {
-    return std::nullopt;
-  }
-  return std::make_pair(static_cast<unsigned int>(major(stat_info.st_dev)),
-                        static_cast<unsigned int>(minor(stat_info.st_dev)));
-}
-
-std::optional<unsigned long long> readDiskIoTimeMsForDevice(unsigned int target_major, unsigned int target_minor) {
-  std::ifstream diskstats("/proc/diskstats");
-  if (!diskstats) {
-    return std::nullopt;
-  }
-
-  std::string line;
-  while (std::getline(diskstats, line)) {
-    std::istringstream line_stream(line);
-    unsigned int major_num = 0;
-    unsigned int minor_num = 0;
-    std::string device_name;
-    if (!(line_stream >> major_num >> minor_num >> device_name)) {
-      continue;
-    }
-    if (major_num != target_major || minor_num != target_minor) {
-      continue;
-    }
-
-    std::vector<unsigned long long> fields;
-    unsigned long long value = 0;
-    while (line_stream >> value) {
-      fields.push_back(value);
-    }
-    if (fields.size() <= 9) {
-      return std::nullopt;
-    }
-    return fields[9];
-  }
-
-  return std::nullopt;
-}
-
-std::optional<double> computeRootDiskBusyPercent() {
-  static std::optional<std::pair<unsigned int, unsigned int>> root_numbers = rootDeviceNumbers();
-  static std::optional<unsigned long long> previous_io_ms;
-  static std::chrono::steady_clock::time_point previous_time;
-
-  if (!root_numbers) {
-    return std::nullopt;
-  }
-
-  const auto current_io_ms = readDiskIoTimeMsForDevice(root_numbers->first, root_numbers->second);
-  const auto now = std::chrono::steady_clock::now();
-  if (!current_io_ms) {
-    return std::nullopt;
-  }
-
-  if (!previous_io_ms) {
-    previous_io_ms = current_io_ms;
-    previous_time = now;
-    return std::nullopt;
-  }
-
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time);
-  const long long delta_ms = static_cast<long long>(*current_io_ms) - static_cast<long long>(*previous_io_ms);
-  previous_io_ms = current_io_ms;
-  previous_time = now;
-
-  if (elapsed.count() <= 0 || delta_ms < 0) {
-    return std::nullopt;
-  }
-
-  const double busy = 100.0 * static_cast<double>(delta_ms) / static_cast<double>(elapsed.count());
-  return clampPercent(busy);
-}
-
-std::optional<double> computeRamUsagePercent(const Snapshot& snapshot) {
-  if (!snapshot.ram.total_kb || !snapshot.ram.available_kb || *snapshot.ram.total_kb <= 0) {
-    return std::nullopt;
-  }
-  const long long total_kb = *snapshot.ram.total_kb;
-  const long long available_kb = std::max(0LL, *snapshot.ram.available_kb);
-  const long long used_kb = std::max(0LL, total_kb - available_kb);
-  return 100.0 * static_cast<double>(used_kb) / static_cast<double>(total_kb);
-}
-
-std::optional<double> computeGpuUsagePercent(const Snapshot& snapshot) {
-  if (snapshot.gpus.empty()) {
-    return std::nullopt;
-  }
-  return snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)].utilization_percent;
-}
-
-std::optional<double> computeGpuVramUsagePercent(const Snapshot& snapshot) {
-  if (snapshot.gpus.empty()) {
-    return std::nullopt;
-  }
-  const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
-  if (gpu.memory_utilization_percent) {
-    return gpu.memory_utilization_percent;
-  }
-  if (gpu.memory_used_mib && gpu.memory_total_mib && *gpu.memory_total_mib > 0.0) {
-    return 100.0 * (*gpu.memory_used_mib) / (*gpu.memory_total_mib);
-  }
-  return std::nullopt;
-}
-
-std::optional<double> computeDiskUsagePercent(const Snapshot& snapshot) {
-  if (!snapshot.disk.total_bytes || !snapshot.disk.free_bytes || *snapshot.disk.total_bytes == 0) {
-    return std::nullopt;
-  }
-  const auto total = *snapshot.disk.total_bytes;
-  const auto free = std::min(*snapshot.disk.free_bytes, total);
-  const auto used = total - free;
-  return 100.0 * static_cast<double>(used) / static_cast<double>(total);
-}
-
-void appendHistoryValue(std::vector<double>* series, const std::optional<double>& value, size_t max_points) {
-  if (!series) {
-    return;
-  }
-  const double next_value = clampPercent(value.value_or(series->empty() ? 0.0 : series->back()));
-  series->push_back(next_value);
-  if (series->size() > max_points) {
-    const size_t remove_count = series->size() - max_points;
-    series->erase(series->begin(), series->begin() + static_cast<std::ptrdiff_t>(remove_count));
-  }
-}
-
-void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max_points,
-                   const std::optional<double>& disk_override_percent) {
-  if (!history || max_points == 0) {
-    return;
-  }
-  appendHistoryValue(&history->cpu_usage, snapshot.cpu.usage_percent, max_points);
-  appendHistoryValue(&history->cpu_temp, snapshot.cpu.temperature_c, max_points);
-  appendHistoryValue(&history->ram_usage, computeRamUsagePercent(snapshot), max_points);
-  appendHistoryValue(&history->gpu_usage, computeGpuUsagePercent(snapshot), max_points);
-  appendHistoryValue(&history->gpu_vram_usage, computeGpuVramUsagePercent(snapshot), max_points);
-  if (disk_override_percent) {
-    appendHistoryValue(&history->disk_usage, disk_override_percent, max_points);
-  } else {
-    appendHistoryValue(&history->disk_usage, computeDiskUsagePercent(snapshot), max_points);
-  }
-}
-
-bool isInsideCanvas(const BrailleCanvas* canvas, int x, int y) {
-  if (!canvas) {
-    return false;
-  }
-  return x >= 0 && y >= 0 && x < canvas->width && y < canvas->height;
-}
-
-void addCanvasMask(BrailleCanvas* canvas, int x, int y, uint16_t mask) {
-  if (!isInsideCanvas(canvas, x, y)) {
-    return;
-  }
-  const size_t index = static_cast<size_t>(y * canvas->width + x);
-  canvas->cells[index] |= mask;
-}
-
-void connectCanvasCells(BrailleCanvas* canvas, int x0, int y0, int x1, int y1) {
-  if (!isInsideCanvas(canvas, x0, y0) || !isInsideCanvas(canvas, x1, y1)) {
-    return;
-  }
-  if (x1 == x0 + 1 && y1 == y0) {
-    addCanvasMask(canvas, x0, y0, kDirRight);
-    addCanvasMask(canvas, x1, y1, kDirLeft);
-    return;
-  }
-  if (x1 == x0 - 1 && y1 == y0) {
-    addCanvasMask(canvas, x0, y0, kDirLeft);
-    addCanvasMask(canvas, x1, y1, kDirRight);
-    return;
-  }
-  if (x1 == x0 && y1 == y0 + 1) {
-    addCanvasMask(canvas, x0, y0, kDirDown);
-    addCanvasMask(canvas, x1, y1, kDirUp);
-    return;
-  }
-  if (x1 == x0 && y1 == y0 - 1) {
-    addCanvasMask(canvas, x0, y0, kDirUp);
-    addCanvasMask(canvas, x1, y1, kDirDown);
-    return;
-  }
-}
-
-std::vector<ProcessInfo> collectTopProcesses(size_t limit) {
-  std::vector<ProcessInfo> processes;
-  if (limit == 0) {
-    return processes;
-  }
-
-  const std::string output =
-      linux_utils::runCommand("ps -eo pid,%cpu,%mem,args --sort=-%cpu --no-headers 2>/dev/null");
-  std::istringstream stream(output);
-  std::string line;
-  while (std::getline(stream, line) && processes.size() < limit) {
-    std::istringstream line_stream(line);
-    ProcessInfo process;
-    if (!(line_stream >> process.pid >> process.cpu_percent >> process.mem_percent)) {
-      continue;
-    }
-
-    std::string command;
-    std::getline(line_stream, command);
-    process.command = linux_utils::trim(command);
-    if (process.command.empty()) {
-      process.command = "<unknown>";
-    }
-    processes.push_back(process);
-  }
-
-  const std::string gpu_output = linux_utils::runCommand(
-      "nvidia-smi pmon -c 1 2>/dev/null | tail -n +3 | awk '{print $2, $4}'");
-  std::istringstream gpu_stream(gpu_output);
-  std::string gpu_line;
-  while (std::getline(gpu_stream, gpu_line)) {
-    if (linux_utils::trim(gpu_line).empty()) {
-      continue;
-    }
-    std::istringstream gpu_iss(gpu_line);
-    int pid;
-    std::string sm_util;
-    if (gpu_iss >> pid >> sm_util && sm_util != "-") {
-      double gpu_util = std::stod(sm_util);
-      for (auto& proc : processes) {
-        if (proc.pid == pid) {
-          proc.gpu_percent = gpu_util;
-          break;
-        }
-      }
-    }
-  }
-
-  return processes;
 }
 
 BrailleCanvas createBrailleCanvas(int width, int height) {
@@ -585,166 +511,130 @@ BrailleCanvas createBrailleCanvas(int width, int height) {
   return canvas;
 }
 
-void rasterizeBrailleLine(BrailleCanvas* canvas, int x0, int y0, int x1, int y1) {
-  if (!canvas || !isInsideCanvas(canvas, x0, y0) || !isInsideCanvas(canvas, x1, y1)) {
+void connectCanvasCells(BrailleCanvas* canvas, int x0, int y0, int x1, int y1) {
+  if (!canvas || !canvas->width || !canvas->height) {
     return;
   }
-  int x = x0;
-  int y = y0;
-  addCanvasMask(canvas, x, y, kDirPoint);
-  const int dx = std::abs(x1 - x0);
-  const int dy = std::abs(y1 - y0);
-  const int sx = x0 < x1 ? 1 : -1;
-  const int sy = y0 < y1 ? 1 : -1;
+  if (x0 < 0 || x0 >= canvas->width || y0 < 0 || y0 >= canvas->height) {
+    return;
+  }
+  if (x1 < 0 || x1 >= canvas->width || y1 < 0 || y1 >= canvas->height) {
+    return;
+  }
+  
+  const size_t idx0 = static_cast<size_t>(y0 * canvas->width + x0);
+  const size_t idx1 = static_cast<size_t>(y1 * canvas->width + x1);
+  
+  if (x1 == x0 + 1 && y1 == y0) {
+    canvas->cells[idx0] |= kDirRight;
+    canvas->cells[idx1] |= kDirLeft;
+  } else if (x1 == x0 - 1 && y1 == y0) {
+    canvas->cells[idx0] |= kDirLeft;
+    canvas->cells[idx1] |= kDirRight;
+  } else if (x1 == x0 && y1 == y0 + 1) {
+    canvas->cells[idx0] |= kDirDown;
+    canvas->cells[idx1] |= kDirUp;
+  } else if (x1 == x0 && y1 == y0 - 1) {
+    canvas->cells[idx0] |= kDirUp;
+    canvas->cells[idx1] |= kDirDown;
+  }
+}
+
+void rasterizeBrailleLine(BrailleCanvas* canvas, int x0, int y0, int x1, int y1) {
+  if (!canvas || !canvas->width || !canvas->height) return;
+  if (x0 < 0 || x0 >= canvas->width || y0 < 0 || y0 >= canvas->height) return;
+  if (x1 < 0 || x1 >= canvas->width || y1 < 0 || y1 >= canvas->height) return;
+  
+  int x = x0, y = y0;
+  canvas->cells[static_cast<size_t>(y * canvas->width + x)] |= kDirPoint;
+  
+  const int dx = std::abs(x1 - x0), dy = std::abs(y1 - y0);
+  const int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
   int error = dx - dy;
 
-  while (true) {
-    if (x == x1 && y == y1) {
-      break;
-    }
-    const int prev_x = x;
-    const int prev_y = y;
+  while (x != x1 || y != y1) {
+    const int prev_x = x, prev_y = y;
     const int twice_error = error * 2;
-    bool moved_x = false;
-    bool moved_y = false;
-    if (twice_error > -dy) {
-      error -= dy;
-      x += sx;
-      moved_x = true;
-    }
-    if (twice_error < dx) {
-      error += dx;
-      y += sy;
-      moved_y = true;
-    }
+    bool moved_x = false, moved_y = false;
+    
+    if (twice_error > -dy) { error -= dy; x += sx; moved_x = true; }
+    if (twice_error < dx) { error += dx; y += sy; moved_y = true; }
 
     if (moved_x && moved_y) {
-      // Render diagonals as connected elbows in the character grid.
-      const int elbow_x = x;
-      const int elbow_y = prev_y;
-      connectCanvasCells(canvas, prev_x, prev_y, elbow_x, elbow_y);
-      connectCanvasCells(canvas, elbow_x, elbow_y, x, y);
+      connectCanvasCells(canvas, prev_x, prev_y, x, prev_y);
+      connectCanvasCells(canvas, x, prev_y, x, y);
     } else {
       connectCanvasCells(canvas, prev_x, prev_y, x, y);
     }
-    addCanvasMask(canvas, x, y, kDirPoint);
+    canvas->cells[static_cast<size_t>(y * canvas->width + x)] |= kDirPoint;
   }
 }
 
 void plotBrailleSeries(BrailleCanvas* canvas, const std::vector<double>& values,
                        double min_value, double max_value) {
-  if (!canvas || canvas->width <= 0 || canvas->height <= 0 || values.empty()) {
-    return;
-  }
-  if (max_value <= min_value) {
-    return;
-  }
+  if (!canvas || canvas->width <= 0 || canvas->height <= 0 || values.empty()) return;
+  if (max_value <= min_value) return;
 
-  const int graph_w = canvas->width;
-  const int graph_h = canvas->height;
-  if (graph_w <= 0 || graph_h <= 0) {
-    return;
-  }
-
+  const int graph_w = canvas->width, graph_h = canvas->height;
   const size_t sample_count = std::min(values.size(), static_cast<size_t>(graph_w));
   const size_t start_index = values.size() - sample_count;
-  if (sample_count == 0) {
-    return;
-  }
+  if (sample_count == 0) return;
 
-  auto valueToPixelYTop = [&](double value) {
+  auto valueToPixelY = [&](double value) {
     const double clamped = std::max(min_value, std::min(max_value, value));
-    const double normalized = (clamped - min_value) / (max_value - min_value);  // 0..1 bottom-origin
+    const double normalized = (clamped - min_value) / (max_value - min_value);
     const int y_from_bottom = static_cast<int>(std::lround(normalized * static_cast<double>(graph_h - 1)));
-    const int y_top = (graph_h - 1) - y_from_bottom;
-    return std::max(0, std::min(graph_h - 1, y_top));
+    return std::max(0, std::min(graph_h - 1, (graph_h - 1) - y_from_bottom));
   };
 
   auto sampleToPixelX = [&](size_t sample_index) {
-    if (sample_count <= 1) {
-      return 0;
-    }
+    if (sample_count <= 1) return 0;
     return static_cast<int>((sample_index * static_cast<size_t>(graph_w - 1)) / (sample_count - 1));
   };
 
   if (sample_count == 1) {
-    addCanvasMask(canvas, sampleToPixelX(0), valueToPixelYTop(values[start_index]), kDirPoint);
+    canvas->cells[static_cast<size_t>(valueToPixelY(values[start_index]) * canvas->width)] |= kDirPoint;
     return;
   }
 
   for (size_t i = 0; i + 1 < sample_count; ++i) {
-    const int px0 = sampleToPixelX(i);
-    const int px1 = sampleToPixelX(i + 1);
-    const int py0 = valueToPixelYTop(values[start_index + i]);
-    const int py1 = valueToPixelYTop(values[start_index + i + 1]);
-    rasterizeBrailleLine(canvas, px0, py0, px1, py1);
+    rasterizeBrailleLine(canvas, sampleToPixelX(i), valueToPixelY(values[start_index + i]),
+                         sampleToPixelX(i + 1), valueToPixelY(values[start_index + i + 1]));
   }
-
-  const int last_px = sampleToPixelX(sample_count - 1);
-  const int last_py = valueToPixelYTop(values.back());
-  addCanvasMask(canvas, last_px, last_py, kDirPoint);
 }
 
 void drawBrailleLayer(WINDOW* win, const BrailleCanvas& canvas, int top, int left, int color_pair) {
-  if (!win || canvas.width <= 0 || canvas.height <= 0 || canvas.cells.empty()) {
-    return;
-  }
+  if (!win || canvas.width <= 0 || canvas.height <= 0 || canvas.cells.empty()) return;
 
   if (has_colors()) {
     wattron(win, COLOR_PAIR(color_pair));
   }
-  const auto glyphForMask = [](uint16_t mask) -> wchar_t {
-    const uint16_t dirs = mask & static_cast<uint16_t>(kDirUp | kDirDown | kDirLeft | kDirRight);
-    if (dirs == 0U) {
-      return (mask & kDirPoint) != 0U ? L'\u00b7' : L' ';
-    }
-    if (dirs == (kDirLeft | kDirRight)) {
-      return L'\u2500';
-    }
-    if (dirs == (kDirUp | kDirDown)) {
-      return L'\u2502';
-    }
-    if (dirs == (kDirDown | kDirRight)) {
-      return L'\u250c';
-    }
-    if (dirs == (kDirDown | kDirLeft)) {
-      return L'\u2510';
-    }
-    if (dirs == (kDirUp | kDirRight)) {
-      return L'\u2514';
-    }
-    if (dirs == (kDirUp | kDirLeft)) {
-      return L'\u2518';
-    }
-    if (dirs == (kDirUp | kDirDown | kDirRight)) {
-      return L'\u251c';
-    }
-    if (dirs == (kDirUp | kDirDown | kDirLeft)) {
-      return L'\u2524';
-    }
-    if (dirs == (kDirLeft | kDirRight | kDirDown)) {
-      return L'\u252c';
-    }
-    if (dirs == (kDirLeft | kDirRight | kDirUp)) {
-      return L'\u2534';
-    }
-    if (dirs == (kDirUp | kDirDown | kDirLeft | kDirRight)) {
-      return L'\u253c';
-    }
-    if ((dirs & static_cast<uint16_t>(kDirLeft | kDirRight)) != 0U) {
-      return L'\u2500';
-    }
-    return L'\u2502';
-  };
   for (int cell_y = 0; cell_y < canvas.height; ++cell_y) {
     for (int cell_x = 0; cell_x < canvas.width; ++cell_x) {
       const uint16_t bits = canvas.cells[static_cast<size_t>(cell_y * canvas.width + cell_x)];
-      if (bits == 0U) {
-        continue;
+      if (bits == 0U) continue;
+      
+      wchar_t glyph = L' ';
+      const uint16_t dirs = bits & static_cast<uint16_t>(kDirUp | kDirDown | kDirLeft | kDirRight);
+      if (dirs == 0U) {
+        glyph = (bits & kDirPoint) != 0U ? L'\u00b7' : L' ';
+      } else if (dirs == (kDirLeft | kDirRight)) {
+        glyph = L'\u2500';
+      } else if (dirs == (kDirUp | kDirDown)) {
+        glyph = L'\u2502';
+      } else if (dirs == (kDirDown | kDirRight)) {
+        glyph = L'\u250c';
+      } else if (dirs == (kDirDown | kDirLeft)) {
+        glyph = L'\u2510';
+      } else if (dirs == (kDirUp | kDirRight)) {
+        glyph = L'\u2514';
+      } else if (dirs == (kDirUp | kDirLeft)) {
+        glyph = L'\u2518';
+      } else {
+        glyph = L'\u253c';
       }
-      const wchar_t glyph_char = glyphForMask(bits);
-      const wchar_t glyph[2] = {glyph_char, L'\0'};
-      mvwaddnwstr(win, top + cell_y, left + cell_x, glyph, 1);
+      const wchar_t glyph_str[2] = {glyph, L'\0'};
+      mvwaddnwstr(win, top + cell_y, left + cell_x, glyph_str, 1);
     }
   }
   if (has_colors()) {
@@ -752,76 +642,479 @@ void drawBrailleLayer(WINDOW* win, const BrailleCanvas& canvas, int top, int lef
   }
 }
 
+#ifdef __APPLE__
+std::vector<ProcessInfo> collectTopProcesses(size_t limit, SortMode sort_mode, int lock_pid) {
+  std::vector<ProcessInfo> processes;
+  if (limit == 0) return processes;
+
+  std::string sort_key = "cpu";
+  switch (sort_mode) {
+    case SortMode::kMem: sort_key = "rsize"; break;
+    case SortMode::kPid: sort_key = "pid"; break;
+    default: sort_key = "cpu"; break;
+  }
+
+  std::string cmd = "ps -eo pid,%cpu,%mem,comm --sort=-" + sort_key + " -c 2>/dev/null | head -" + std::to_string(limit + 1);
+  if (lock_pid > 0) {
+    cmd = "ps -o pid,%cpu,%mem,comm -p " + std::to_string(lock_pid) + " -c 2>/dev/null";
+  }
+
+  FILE* pipe = popen(cmd.c_str(), "r");
+  if (!pipe) return processes;
+
+  char buffer[512];
+  bool first = true;
+  while (fgets(buffer, sizeof(buffer), pipe)) {
+    if (first) { first = false; continue; }
+    
+    ProcessInfo proc;
+    std::istringstream iss(buffer);
+    if (iss >> proc.pid >> proc.cpu_percent >> proc.mem_percent) {
+      std::getline(iss >> std::ws, proc.command);
+      if (!proc.command.empty()) {
+        processes.push_back(proc);
+      }
+    }
+  }
+  pclose(pipe);
+  return processes;
+}
+#else
+std::string trimProcessCommand(const std::string& command, size_t max_width = 50) {
+  if (command.size() <= max_width) {
+    return command;
+  }
+  if (max_width <= 3) {
+    return command.substr(0, max_width);
+  }
+  return command.substr(0, max_width - 3) + "...";
+}
+
+std::unordered_map<int, double> collectGpuProcessUsage() {
+  std::unordered_map<int, double> usage_by_pid;
+
+  FILE* gpu_pipe = popen("nvidia-smi pmon -c 1 2>/dev/null | tail -n +3 | awk '{print $2, $4}'", "r");
+  if (!gpu_pipe) {
+    return usage_by_pid;
+  }
+
+  char gpu_buffer[256];
+  while (fgets(gpu_buffer, sizeof(gpu_buffer), gpu_pipe)) {
+    int pid = 0;
+    std::string sm_util;
+    std::istringstream stream(gpu_buffer);
+    if (!(stream >> pid >> sm_util) || pid <= 0 || sm_util == "-") {
+      continue;
+    }
+    try {
+      usage_by_pid[pid] = std::stod(sm_util);
+    } catch (...) {
+    }
+  }
+
+  pclose(gpu_pipe);
+  return usage_by_pid;
+}
+
+std::vector<ProcessInfo> collectProcessesFromPsCommand(const std::string& command) {
+  std::vector<ProcessInfo> processes;
+
+  FILE* pipe = popen(command.c_str(), "r");
+  if (!pipe) {
+    return processes;
+  }
+
+  char buffer[512];
+  while (fgets(buffer, sizeof(buffer), pipe)) {
+    ProcessInfo proc;
+    std::istringstream iss(buffer);
+    if (!(iss >> proc.pid >> proc.cpu_percent >> proc.mem_percent)) {
+      continue;
+    }
+    std::getline(iss >> std::ws, proc.command);
+    proc.command = trimProcessCommand(proc.command);
+    processes.push_back(proc);
+  }
+
+  pclose(pipe);
+  return processes;
+}
+
+void attachGpuPercents(std::vector<ProcessInfo>* processes,
+                       const std::unordered_map<int, double>& usage_by_pid) {
+  if (!processes) {
+    return;
+  }
+  for (auto& process : *processes) {
+    if (const auto it = usage_by_pid.find(process.pid); it != usage_by_pid.end()) {
+      process.gpu_percent = it->second;
+    }
+  }
+}
+
+std::vector<ProcessInfo> collectTopProcesses(size_t limit, SortMode sort_mode, int lock_pid) {
+  std::vector<ProcessInfo> processes;
+  if (limit == 0) return processes;
+
+  const auto gpu_usage_by_pid = collectGpuProcessUsage();
+  if (lock_pid > 0) {
+    processes = collectProcessesFromPsCommand(
+        "ps -o pid,%cpu,%mem,args -p " + std::to_string(lock_pid) + " --no-headers 2>/dev/null");
+    attachGpuPercents(&processes, gpu_usage_by_pid);
+    return processes;
+  }
+
+  if (sort_mode == SortMode::kGpu && !gpu_usage_by_pid.empty()) {
+    std::string pid_list;
+    for (const auto& [pid, _] : gpu_usage_by_pid) {
+      if (!pid_list.empty()) {
+        pid_list += ",";
+      }
+      pid_list += std::to_string(pid);
+    }
+
+    processes = collectProcessesFromPsCommand(
+        "ps -p " + pid_list + " -o pid,%cpu,%mem,args --no-headers 2>/dev/null");
+    attachGpuPercents(&processes, gpu_usage_by_pid);
+    std::stable_sort(processes.begin(), processes.end(), [](const ProcessInfo& lhs, const ProcessInfo& rhs) {
+      if (lhs.gpu_percent != rhs.gpu_percent) {
+        return lhs.gpu_percent > rhs.gpu_percent;
+      }
+      if (lhs.cpu_percent != rhs.cpu_percent) {
+        return lhs.cpu_percent > rhs.cpu_percent;
+      }
+      return lhs.pid < rhs.pid;
+    });
+    if (processes.size() > limit) {
+      processes.resize(limit);
+    }
+    return processes;
+  }
+
+  std::string sort_key = "%cpu";
+  switch (sort_mode) {
+    case SortMode::kMem: sort_key = "%mem"; break;
+    case SortMode::kPid: sort_key = "pid"; break;
+    default: sort_key = "%cpu"; break;
+  }
+
+  processes = collectProcessesFromPsCommand(
+      "ps -eo pid,%cpu,%mem,args --sort=-" + sort_key + " --no-headers 2>/dev/null | head -" +
+      std::to_string(limit));
+  attachGpuPercents(&processes, gpu_usage_by_pid);
+  return processes;
+}
+#endif
+
+void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max_points,
+                   const std::optional<double>& disk_busy_percent) {
+  if (!history || max_points == 0) return;
+
+  auto appendValue = [&](std::vector<double>& series, const std::optional<double>& value) {
+    const double next_value = std::max(0.0, std::min(100.0, value.value_or(series.empty() ? 0.0 : series.back())));
+    series.push_back(next_value);
+    if (series.size() > max_points) {
+      series.erase(series.begin(), series.begin() + static_cast<std::ptrdiff_t>(series.size() - max_points));
+    }
+  };
+
+  appendValue(history->cpu_usage, snapshot.cpu.usage_percent);
+  appendValue(history->cpu_temp, snapshot.cpu.temperature_c);
+  
+  if (snapshot.ram.total_kb && snapshot.ram.available_kb && *snapshot.ram.total_kb > 0) {
+    const double ram_pct = 100.0 * (static_cast<double>(*snapshot.ram.total_kb) - 
+                                    static_cast<double>(*snapshot.ram.available_kb)) / 
+                           static_cast<double>(*snapshot.ram.total_kb);
+    appendValue(history->ram_usage, ram_pct);
+  } else {
+    appendValue(history->ram_usage, std::nullopt);
+  }
+
+  if (!snapshot.gpus.empty()) {
+    const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
+    appendValue(history->gpu_usage, gpu.utilization_percent);
+    if (gpu.memory_utilization_percent) {
+      appendValue(history->gpu_vram_usage, gpu.memory_utilization_percent);
+    } else if (gpu.memory_used_mib && gpu.memory_total_mib && *gpu.memory_total_mib > 0) {
+      appendValue(history->gpu_vram_usage, 100.0 * (*gpu.memory_used_mib) / (*gpu.memory_total_mib));
+    } else {
+      appendValue(history->gpu_vram_usage, std::nullopt);
+    }
+  } else {
+    appendValue(history->gpu_usage, std::nullopt);
+    appendValue(history->gpu_vram_usage, std::nullopt);
+  }
+
+  if (disk_busy_percent) {
+    appendValue(history->disk_usage, disk_busy_percent);
+  } else if (snapshot.disk.total_bytes && snapshot.disk.free_bytes && *snapshot.disk.total_bytes > 0) {
+    const double disk_pct = 100.0 * static_cast<double>(*snapshot.disk.total_bytes - *snapshot.disk.free_bytes) /
+                            static_cast<double>(*snapshot.disk.total_bytes);
+    appendValue(history->disk_usage, disk_pct);
+  } else {
+    appendValue(history->disk_usage, std::nullopt);
+  }
+}
+
+#ifdef __APPLE__
+std::optional<double> computeRootDiskBusyPercent() {
+  static std::optional<unsigned long long> previous_read_ops;
+  static std::optional<unsigned long long> previous_write_ops;
+  static std::chrono::steady_clock::time_point previous_time;
+
+  const std::string output = darwin_utils::runCommand("iostat -d disk0 1 1 2>/dev/null | tail -1");
+  if (output.empty()) {
+    return std::nullopt;
+  }
+
+  std::istringstream iss(output);
+  std::string device;
+  unsigned long long read_ops = 0, write_ops = 0;
+  
+  iss >> device;
+  if (device.empty()) return std::nullopt;
+  
+  std::vector<unsigned long long> values;
+  unsigned long long val;
+  while (iss >> val) {
+    values.push_back(val);
+  }
+  
+  if (values.size() < 2) return std::nullopt;
+  
+  read_ops = values[0];
+  write_ops = values[1];
+  
+  const auto now = std::chrono::steady_clock::now();
+  
+  if (!previous_read_ops || !previous_write_ops) {
+    previous_read_ops = read_ops;
+    previous_write_ops = write_ops;
+    previous_time = now;
+    return std::nullopt;
+  }
+  
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time);
+  const unsigned long long total_ops = (read_ops - *previous_read_ops) + (write_ops - *previous_write_ops);
+  
+  previous_read_ops = read_ops;
+  previous_write_ops = write_ops;
+  previous_time = now;
+  
+  if (elapsed.count() <= 0) return std::nullopt;
+  
+  const double ops_per_sec = static_cast<double>(total_ops) / (static_cast<double>(elapsed.count()) / 1000.0);
+  const double busy_pct = std::min(100.0, ops_per_sec / 100.0 * 100.0);
+  
+  return std::max(0.0, std::min(100.0, busy_pct));
+}
+#else
+struct DiskStats {
+  unsigned long long sectors_read = 0;
+  unsigned long long sectors_written = 0;
+  unsigned long long io_time = 0;
+};
+
+std::optional<std::pair<double, double>> computeRootDiskSpeed() {
+  static std::string root_device;
+  static std::optional<DiskStats> previous_stats;
+  static std::chrono::steady_clock::time_point previous_time;
+
+  if (root_device.empty()) {
+    std::ifstream mounts("/proc/self/mounts");
+    std::string line;
+    while (std::getline(mounts, line)) {
+      std::istringstream iss(line);
+      std::string device, mountpoint, fstype;
+      if (iss >> device >> mountpoint >> fstype && mountpoint == "/") {
+        std::string dev = device;
+        size_t last_slash = dev.rfind('/');
+        if (last_slash != std::string::npos) {
+          dev = dev.substr(last_slash + 1);
+        }
+        if (dev.find("nvme") != std::string::npos) {
+          size_t pns = dev.find("p");
+          if (pns != std::string::npos) {
+            dev = dev.substr(0, pns);
+          }
+        } else if (dev.find_first_of("0123456789") != std::string::npos) {
+          size_t end = dev.find_first_of("0123456789");
+          while (end < dev.size() && std::isdigit(dev[end])) end++;
+          dev = dev.substr(0, end);
+        }
+        root_device = dev;
+        break;
+      }
+    }
+    if (root_device.empty()) root_device = "sda";
+  }
+
+  std::ifstream diskstats("/proc/diskstats");
+  if (!diskstats) return std::nullopt;
+
+  DiskStats current_stats;
+  bool found = false;
+  std::string line;
+  while (std::getline(diskstats, line)) {
+    std::istringstream line_stream(line);
+    unsigned int major_num = 0, minor_num = 0;
+    std::string device_name;
+    if (!(line_stream >> major_num >> minor_num >> device_name)) continue;
+    if (device_name != root_device) continue;
+    
+    found = true;
+    unsigned long long value = 0;
+    for (int i = 0; i < 14 && line_stream >> value; i++) {
+      if (i == 2) current_stats.sectors_read = value;
+      else if (i == 6) current_stats.sectors_written = value;
+      else if (i == 7 || i == 11) current_stats.io_time += value;
+    }
+    break;
+  }
+
+  if (!found) return std::make_pair(0.0, 0.0);
+
+  const auto now = std::chrono::steady_clock::now();
+  
+  if (!previous_stats.has_value()) {
+    previous_stats = current_stats;
+    previous_time = now;
+    return std::make_pair(0.0, 0.0);
+  }
+
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time).count();
+  if (elapsed_ms <= 0) {
+    previous_stats = current_stats;
+    previous_time = now;
+    return std::make_pair(0.0, 0.0);
+  }
+
+  const long long sectors_read_delta = static_cast<long long>(current_stats.sectors_read) - static_cast<long long>(previous_stats->sectors_read);
+  const long long sectors_written_delta = static_cast<long long>(current_stats.sectors_written) - static_cast<long long>(previous_stats->sectors_written);
+  
+  previous_stats = current_stats;
+  previous_time = now;
+
+  const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
+  const double read_kbs = (static_cast<double>(sectors_read_delta) * 0.5) / elapsed_sec;
+  const double write_kbs = (static_cast<double>(sectors_written_delta) * 0.5) / elapsed_sec;
+
+  return std::make_pair(std::max(0.0, read_kbs), std::max(0.0, write_kbs));
+}
+
+std::optional<double> computeRootDiskBusyPercent() {
+  static std::optional<DiskStats> previous_stats;
+  static std::chrono::steady_clock::time_point previous_time;
+
+  auto speed = computeRootDiskSpeed();
+  if (!speed) return std::nullopt;
+
+  DiskStats current_stats;
+  std::ifstream diskstats("/proc/diskstats");
+  if (!diskstats) return std::nullopt;
+
+  static std::string root_device;
+  if (root_device.empty()) {
+    FILE* fp = fopen("/proc/self/mounts", "r");
+    if (fp) {
+      char device[256], mountpoint[256], fstype[64];
+      while (fscanf(fp, "%255s %255s %63s", device, mountpoint, fstype) == 3) {
+        if (strcmp(mountpoint, "/") == 0) {
+          std::string dev(device);
+          size_t last_slash = dev.rfind('/');
+          if (last_slash != std::string::npos) {
+            root_device = dev.substr(last_slash + 1);
+          }
+          if (root_device.find("nvme") != std::string::npos) {
+            size_t pns = root_device.find("p");
+            if (pns != std::string::npos) {
+              root_device = root_device.substr(0, pns);
+            }
+          } else if (root_device.find_first_of("0123456789") != std::string::npos) {
+            size_t digit_pos = root_device.find_first_of("0123456789");
+            size_t end = digit_pos;
+            while (end < root_device.size() && std::isdigit(root_device[end])) {
+              end++;
+            }
+            root_device = root_device.substr(0, end);
+          }
+          break;
+        }
+      }
+      fclose(fp);
+    }
+    if (root_device.empty()) root_device = "sda";
+  }
+
+  std::string line;
+  while (std::getline(diskstats, line)) {
+    std::istringstream line_stream(line);
+    unsigned int major_num = 0, minor_num = 0;
+    std::string device_name;
+    if (!(line_stream >> major_num >> minor_num >> device_name)) continue;
+    if (device_name != root_device) continue;
+
+    std::vector<unsigned long long> fields;
+    unsigned long long value = 0;
+    while (line_stream >> value) {
+      fields.push_back(value);
+    }
+    
+    if (fields.size() >= 14) {
+      current_stats.io_time = fields[7] + fields[11];
+      break;
+    }
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (!previous_stats) {
+    previous_stats = current_stats;
+    previous_time = now;
+    return 0.0;
+  }
+
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time).count();
+  const long long io_time_delta = static_cast<long long>(current_stats.io_time) - static_cast<long long>(previous_stats->io_time);
+  
+  previous_stats = current_stats;
+  previous_time = now;
+
+  if (elapsed_ms <= 0 || io_time_delta < 0) return 0.0;
+  
+  const double busy = 100.0 * static_cast<double>(io_time_delta) / static_cast<double>(elapsed_ms);
+  return std::max(0.0, std::min(100.0, busy));
+}
+#endif
+
 int estimateCpuRows(const Snapshot& snapshot) {
-  int rows = 0;
-  rows += 5;  // CPU model, topology, temp, speed, usage text.
-  if (snapshot.cpu.usage_percent) {
-    ++rows;
-  }
-  if (snapshot.cpu.temperature_c) {
-    ++rows;
-  }
+  int rows = 5;
+  if (snapshot.cpu.usage_percent) ++rows;
+  if (snapshot.cpu.temperature_c) ++rows;
   return rows;
 }
 
-int estimateRamRows(const Snapshot& snapshot) {
-  if (!snapshot.ram.total_kb || !snapshot.ram.available_kb || *snapshot.ram.total_kb <= 0) {
-    return 1;  // N/A line.
-  }
-  return 3;  // Used, available, usage bar.
-}
+int estimateRamRows() { return 4; }
+int estimateNetworkRows() { return 4; }
 
 int estimateGpuRows(const Snapshot& snapshot) {
-  int rows = 0;
-  if (snapshot.gpus.empty()) {
-    rows += 2;  // no-gpu message + tip
-  } else {
-    if (!anyGpuHasTelemetry(snapshot.gpus)) {
-      rows += static_cast<int>(snapshot.gpus.size());  // Card 1, Card 2, ...
-      return rows;
-    }
-
-    const size_t display_gpu_index = pickDisplayGpuIndex(snapshot.gpus);
-    const GpuMetrics& gpu = snapshot.gpus[display_gpu_index];
-    rows += 6;  // GPU base lines.
-    if (!gpu.memory_used_mib) {
-      ++rows;
-    }
-    if (gpu.utilization_percent) {
-      ++rows;
-    }
-    if (gpu.memory_utilization_percent) {
-      ++rows;
-    }
-    if (countAdditionalRelevantGpus(snapshot.gpus, display_gpu_index) > 1) {
-      ++rows;
-    }
+  if (snapshot.gpus.empty()) return 3;
+  if (!anyGpuHasTelemetry(snapshot.gpus)) {
+    return static_cast<int>(std::min(snapshot.gpus.size(), static_cast<size_t>(5)));
   }
-  return rows;
+  return 7;
 }
 
-int estimateDiskRows(const Snapshot& snapshot) {
-  int rows = 1;  // Mount.
-  if (!snapshot.disk.total_bytes || !snapshot.disk.free_bytes || *snapshot.disk.total_bytes == 0) {
-    ++rows;  // unavailable line.
-  } else {
-    rows += 2;  // free line + used bar.
-  }
-  return rows;
-}
-
-int estimateHistoryRows() {
-  return 12;  // Legend + graph + listed metrics.
-}
+int estimateDiskRows() { return 4; }
+int estimateHistoryRows() { return 12; }
 
 void splitColumnHeights(int total_h, int top_pref_h, int bottom_pref_h, int gap, int* top_h, int* bottom_h) {
   const int min_panel_h = 4;
   const int available = std::max(min_panel_h * 2, total_h - gap);
   const int pref_sum = std::max(1, top_pref_h + bottom_pref_h);
 
-  int proposed_top =
-      static_cast<int>(std::round(static_cast<double>(available) * static_cast<double>(top_pref_h) /
-                                  static_cast<double>(pref_sum)));
+  int proposed_top = static_cast<int>(std::round(static_cast<double>(available) * 
+                                                  static_cast<double>(top_pref_h) / 
+                                                  static_cast<double>(pref_sum)));
   proposed_top = std::max(min_panel_h, std::min(available - min_panel_h, proposed_top));
 
   *top_h = proposed_top;
@@ -829,44 +1122,69 @@ void splitColumnHeights(int total_h, int top_pref_h, int bottom_pref_h, int gap,
 }
 
 void renderCpuPanel(WINDOW* panel, const Snapshot& snapshot) {
-  if (!panel) {
-    return;
-  }
+  if (!panel) return;
+  
   int row = 1;
-  addWindowLine(panel, row++, "CPU: " + snapshot.cpu.name);
+  const int max_y = getmaxy(panel);
+  
+  wattron(panel, A_BOLD);
+  if (has_colors()) {
+    wattron(panel, COLOR_PAIR(4));
+  }
+  mvwaddstr(panel, row++, 2, snapshot.cpu.name.c_str());
+  if (has_colors()) {
+    wattroff(panel, COLOR_PAIR(4));
+  }
+  wattroff(panel, A_BOLD);
+  
   addWindowLine(panel, row++, "Topology: " + formatCpuTopology(snapshot.cpu));
   addWindowLine(panel, row++, "Speed: " + formatCpuFrequency(snapshot.cpu.frequency_mhz));
 
-  if (snapshot.cpu.usage_percent && row < getmaxy(panel) - 1) {
-    drawPipeBar(panel, row++, "Usage", *snapshot.cpu.usage_percent);
+  if (snapshot.cpu.usage_percent && row < max_y - 1) {
+    drawBar(panel, row++, "Usage", *snapshot.cpu.usage_percent);
   }
-  if (snapshot.cpu.temperature_c && row < getmaxy(panel) - 1) {
-    drawPipeBar(panel, row++, "Temp ", *snapshot.cpu.temperature_c , 1);
+  if (snapshot.cpu.temperature_c && row < max_y - 1) {
+    drawBar(panel, row++, "Temp ", *snapshot.cpu.temperature_c, 1);
   }
 }
 
 void renderNetworkPanel(WINDOW* panel, const Snapshot& snapshot) {
-  if (!panel) {
-    return;
-  }
-  int row = 1;
+  if (!panel) return;
   
+  int row = 1;
+
   const auto& net = snapshot.network;
   if (net.interface.empty()) {
     addWindowLine(panel, row++, "N/A");
     return;
   }
 
+  wattron(panel, A_BOLD);
   addWindowLine(panel, row++, "Interface: " + net.interface);
-  addWindowLine(panel, row++, "Down: " + formatOptional(net.rx_kbps, " KB/s", 1));
-  addWindowLine(panel, row++, "Up: " + formatOptional(net.tx_kbps, " KB/s", 1));
+  wattroff(panel, A_BOLD);
+  
+  if (has_colors()) {
+    wattron(panel, COLOR_PAIR(1));
+  }
+  addWindowLine(panel, row++, "RX: " + formatOptional(net.rx_kbps, " KB/s", 1));
+  if (has_colors()) {
+    wattroff(panel, COLOR_PAIR(1));
+  }
+  
+  if (has_colors()) {
+    wattron(panel, COLOR_PAIR(3));
+  }
+  addWindowLine(panel, row++, "TX: " + formatOptional(net.tx_kbps, " KB/s", 1));
+  if (has_colors()) {
+    wattroff(panel, COLOR_PAIR(3));
+  }
 }
 
 void renderRamPanel(WINDOW* panel, const Snapshot& snapshot) {
-  if (!panel) {
-    return;
-  }
+  if (!panel) return;
+  
   int row = 1;
+  const int max_y = getmaxy(panel);
 
   if (!snapshot.ram.total_kb || !snapshot.ram.available_kb || *snapshot.ram.total_kb <= 0) {
     addWindowLine(panel, row++, "N/A");
@@ -881,21 +1199,21 @@ void renderRamPanel(WINDOW* panel, const Snapshot& snapshot) {
   const unsigned long long used_bytes = static_cast<unsigned long long>(used_kb) * 1024ULL;
   const unsigned long long available_bytes = static_cast<unsigned long long>(available_kb) * 1024ULL;
 
-  const double used_pct = (total_kb > 0) ? (100.0 * static_cast<double>(used_kb) / static_cast<double>(total_kb))
-                                         : 0.0;
+  const double used_pct = (total_kb > 0) ? (100.0 * static_cast<double>(used_kb) / 
+                                             static_cast<double>(total_kb)) : 0.0;
 
   addWindowLine(panel, row++, "Used: " + humanBytes(used_bytes) + " / " + humanBytes(total_bytes));
   addWindowLine(panel, row++, "Available: " + humanBytes(available_bytes));
-  if (row < getmaxy(panel) - 1) {
-    drawPipeBar(panel, row++, "Usage", used_pct);
+  if (row < max_y - 1) {
+    drawBar(panel, row++, "Usage", used_pct);
   }
 }
 
 void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
-  if (!panel) {
-    return;
-  }
+  if (!panel) return;
+  
   int row = 1;
+  const int max_y = getmaxy(panel);
 
   if (!snapshot.gpus.empty()) {
     const size_t display_gpu_index = pickDisplayGpuIndex(snapshot.gpus);
@@ -904,7 +1222,7 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
 
     if (!anyGpuHasTelemetry(snapshot.gpus)) {
       size_t listed = 0;
-      for (size_t i = 0; i < snapshot.gpus.size() && row < getmaxy(panel) - 1; ++i) {
+      for (size_t i = 0; i < snapshot.gpus.size() && row < max_y - 1; ++i) {
         const GpuMetrics& item = snapshot.gpus[i];
         std::string line = item.name + " [" + item.source + "]";
         if (in_use_gpu_index && *in_use_gpu_index == i) {
@@ -914,7 +1232,7 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
         ++listed;
       }
 
-      if (listed < snapshot.gpus.size() && row < getmaxy(panel) - 1) {
+      if (listed < snapshot.gpus.size() && row < max_y - 1) {
         const size_t remaining = snapshot.gpus.size() - listed;
         if (remaining > 1) {
           addWindowLine(panel, row++, "+" + std::to_string(remaining) + " more GPU(s)");
@@ -931,39 +1249,37 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
     if (in_use_gpu_index && *in_use_gpu_index == display_gpu_index) {
       gpu_header += " (in use)";
     }
+    
+    wattron(panel, A_BOLD);
     addWindowLine(panel, row++, gpu_header);
+    wattroff(panel, A_BOLD);
 
     addWindowLine(panel, row++, "Temperature: " + formatOptional(gpu.temperature_c, " C", 1));
     addWindowLine(panel, row++, "Speed: " + formatOptional(gpu.core_clock_mhz, " MHz", 0));
     addWindowLine(panel, row++, "Power: " + formatOptional(gpu.power_w, " W", 1));
     addWindowLine(panel, row++, "VRAM: " + formatGpuVramUsage(gpu));
 
-    if (!gpu.memory_used_mib && row < getmaxy(panel) - 1) {
+    if (!gpu.memory_used_mib && row < max_y - 1) {
       addWindowLine(panel, row++, "VRAM source not exposed");
     }
 
-    if (gpu.utilization_percent && row < getmaxy(panel) - 1) {
-      drawPipeBar(panel, row++, "Util", *gpu.utilization_percent);
+    if (gpu.utilization_percent && row < max_y - 1) {
+      drawBar(panel, row++, "Util", *gpu.utilization_percent);
     }
-    if (gpu.memory_utilization_percent && row < getmaxy(panel) - 1) {
-      drawPipeBar(panel, row++, "VRAM", *gpu.memory_utilization_percent);
-    }
-
-    const size_t extra_relevant_gpu_count = countAdditionalRelevantGpus(snapshot.gpus, display_gpu_index);
-    if (extra_relevant_gpu_count > 1 && row < getmaxy(panel) - 1) {
-      addWindowLine(panel, row++, "+" + std::to_string(extra_relevant_gpu_count) + " more GPU(s)");
+    if (gpu.memory_utilization_percent && row < max_y - 1) {
+      drawBar(panel, row++, "VRAM", *gpu.memory_utilization_percent);
     }
   } else {
     addWindowLine(panel, row++, "No GPU telemetry found");
-    addWindowLine(panel, row++, "Tip: install NVIDIA drivers / sensors");
   }
 }
 
 void renderDiskPanel(WINDOW* panel, const Snapshot& snapshot) {
-  if (!panel) {
-    return;
-  }
+  if (!panel) return;
+  
   int row = 1;
+  const int max_y = getmaxy(panel);
+  
   addWindowLine(panel, row++, "Mount: " + snapshot.disk.mount_point);
 
   if (!snapshot.disk.total_bytes || !snapshot.disk.free_bytes || *snapshot.disk.total_bytes == 0) {
@@ -978,15 +1294,15 @@ void renderDiskPanel(WINDOW* panel, const Snapshot& snapshot) {
   const double used_pct = 100.0 * static_cast<double>(used) / static_cast<double>(total);
 
   addWindowLine(panel, row++, "Free: " + humanBytes(free) + " / " + humanBytes(total));
-  if (row < getmaxy(panel) - 1) {
-    drawPipeBar(panel, row++, "Used", used_pct);
+  if (row < max_y - 1) {
+    drawBar(panel, row++, "Used", used_pct);
   }
 }
 
-void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std::vector<ProcessInfo>& processes) {
-  if (!panel) {
-    return;
-  }
+void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history,
+                        const std::vector<ProcessInfo>& processes, int selected_pid, int lock_pid,
+                        bool show_selection_highlight, SortMode sort_mode) {
+  if (!panel) return;
 
   const int max_y = getmaxy(panel);
   const int max_x = getmaxx(panel);
@@ -998,6 +1314,7 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   int row = 1;
   const int legend_row = row++;
   int legend_col = 2;
+  
   const auto addLegendItem = [&](const std::string& text, int pair) {
     addColoredText(panel, legend_row, legend_col, text + " ", pair);
     const int line_start = legend_col + static_cast<int>(text.size()) + 1;
@@ -1012,11 +1329,11 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
     }
     legend_col += static_cast<int>(text.size()) + 7;
   };
+  
   addLegendItem("CPU", 4);
   addLegendItem("TEMP", 3);
   addLegendItem("RAM", 2);
   addLegendItem("GPU", 1);
-  addLegendItem("VRAM", 5);
   addLegendItem("DISK", 6);
 
   const int graph_top = row;
@@ -1034,6 +1351,7 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   const int graph_left = 7;
   const int graph_right = max_x - 3;
   const int graph_w = graph_right - graph_left + 1;
+  
   if (graph_w < 10 || graph_h < 3) {
     addWindowLine(panel, row, "Not enough space for trend graph.");
     return;
@@ -1043,6 +1361,7 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   mvwprintw(panel, graph_top, 2, "100");
   mvwprintw(panel, mid_y, 3, "50");
   mvwprintw(panel, graph_bottom, 4, "0");
+  
   for (int x = graph_left; x <= graph_right; ++x) {
     mvwaddch(panel, graph_top, x, ACS_HLINE);
     mvwaddch(panel, mid_y, x, ACS_HLINE);
@@ -1053,21 +1372,18 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
   BrailleCanvas cpu_temp_cells = createBrailleCanvas(graph_w, graph_h);
   BrailleCanvas ram_cells = createBrailleCanvas(graph_w, graph_h);
   BrailleCanvas gpu_cells = createBrailleCanvas(graph_w, graph_h);
-  BrailleCanvas vram_cells = createBrailleCanvas(graph_w, graph_h);
   BrailleCanvas disk_cells = createBrailleCanvas(graph_w, graph_h);
 
   plotBrailleSeries(&cpu_cells, history.cpu_usage, 0.0, 100.0);
   plotBrailleSeries(&cpu_temp_cells, history.cpu_temp, 0.0, 100.0);
   plotBrailleSeries(&ram_cells, history.ram_usage, 0.0, 100.0);
   plotBrailleSeries(&gpu_cells, history.gpu_usage, 0.0, 100.0);
-  plotBrailleSeries(&vram_cells, history.gpu_vram_usage, 0.0, 100.0);
   plotBrailleSeries(&disk_cells, history.disk_usage, 0.0, 100.0);
 
   drawBrailleLayer(panel, disk_cells, graph_top, graph_left, 6);
   drawBrailleLayer(panel, ram_cells, graph_top, graph_left, 2);
   drawBrailleLayer(panel, cpu_temp_cells, graph_top, graph_left, 3);
   drawBrailleLayer(panel, gpu_cells, graph_top, graph_left, 1);
-  drawBrailleLayer(panel, vram_cells, graph_top, graph_left, 5);
   drawBrailleLayer(panel, cpu_cells, graph_top, graph_left, 4);
 
   if (!has_table) {
@@ -1079,18 +1395,68 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
     mvwaddch(panel, separator_row, x, ACS_HLINE);
   }
   for (int x = 1; x < max_x - 1; ++x) {
-    mvwaddch(panel, table_top -2, x, ACS_HLINE);
+    mvwaddch(panel, table_top - 2, x, ACS_HLINE);
   }
-  
 
   int table_row = table_top;
   bool show_gpu_col = true;
 
-  if (show_gpu_col) {
-    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   GPU%   COMMAND", 7);
-  } else {
-    addColoredText(panel, table_row++, 2, "   PID   CPU%   MEM%   COMMAND", 7);
+  wattron(panel, A_BOLD);
+  int col = 2;
+  std::string pid_text = "PID";
+  std::string cpu_text = "CPU%";
+  std::string mem_text = "MEM%";
+  std::string gpu_text = "GPU%";
+  
+  if (sort_mode == SortMode::kPid) {
+    if (has_colors()) wattron(panel, COLOR_PAIR(4));
+    wattron(panel, A_UNDERLINE);
   }
+  mvwaddstr(panel, table_row, col, pid_text.c_str());
+  if (sort_mode == SortMode::kPid) {
+    wattroff(panel, A_UNDERLINE);
+    if (has_colors()) wattroff(panel, COLOR_PAIR(4));
+  }
+  col += 8;
+  
+  if (sort_mode == SortMode::kCpu) {
+    if (has_colors()) wattron(panel, COLOR_PAIR(4));
+    wattron(panel, A_UNDERLINE);
+  }
+  mvwaddstr(panel, table_row, col, cpu_text.c_str());
+  if (sort_mode == SortMode::kCpu) {
+    wattroff(panel, A_UNDERLINE);
+    if (has_colors()) wattroff(panel, COLOR_PAIR(4));
+  }
+  col += 8;
+  
+  if (sort_mode == SortMode::kMem) {
+    if (has_colors()) wattron(panel, COLOR_PAIR(4));
+    wattron(panel, A_UNDERLINE);
+  }
+  mvwaddstr(panel, table_row, col, mem_text.c_str());
+  if (sort_mode == SortMode::kMem) {
+    wattroff(panel, A_UNDERLINE);
+    if (has_colors()) wattroff(panel, COLOR_PAIR(4));
+  }
+  col += 8;
+  
+  if (show_gpu_col) {
+    if (sort_mode == SortMode::kGpu) {
+      if (has_colors()) wattron(panel, COLOR_PAIR(4));
+      wattron(panel, A_UNDERLINE);
+    }
+    mvwaddstr(panel, table_row, col, gpu_text.c_str());
+    if (sort_mode == SortMode::kGpu) {
+      wattroff(panel, A_UNDERLINE);
+      if (has_colors()) wattroff(panel, COLOR_PAIR(4));
+    }
+    col += 8;
+  }
+  
+  mvwaddstr(panel, table_row, col, "COMMAND");
+  table_row++;
+  wattroff(panel, A_BOLD);
 
   const int max_entries = table_rows - 1;
   for (int i = 0; i < max_entries; ++i) {
@@ -1098,41 +1464,483 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history, const std:
       break;
     }
     const auto& process = processes[static_cast<size_t>(i)];
+    const bool is_selected = process.pid == selected_pid;
+    const bool is_locked = process.pid == lock_pid;
+    const bool show_row_highlight = is_locked || (show_selection_highlight && is_selected && !is_locked);
+    
+    if (show_row_highlight) {
+      if (has_colors()) {
+        wattron(panel, COLOR_PAIR(5));
+      }
+      wattron(panel, A_REVERSE);
+    }
+    
     std::ostringstream line;
-    line << std::setw(6) << process.pid << " " << std::setw(6) << std::fixed << std::setprecision(1)
-         << process.cpu_percent << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent;
+    line << std::setw(6) << process.pid << " "
+         << std::setw(6) << std::fixed << std::setprecision(1) << process.cpu_percent << " "
+         << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent;
     if (show_gpu_col) {
       line << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.gpu_percent;
     }
-    line << " " << process.command;
+    line << " ";
+    if (is_locked) {
+      line << "*";
+    } else {
+      line << " ";
+    }
+    line << process.command;
     addWindowLine(panel, table_row++, line.str());
+    
+    if (show_row_highlight) {
+      wattroff(panel, A_REVERSE);
+      if (has_colors()) {
+        wattroff(panel, COLOR_PAIR(5));
+      }
+    }
   }
 }
 
-void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
-                    const std::vector<ProcessInfo>& processes, const std::string& host) {
+void addClippedText(WINDOW* win, int row, int col, int width, const std::string& text) {
+  if (!win || width <= 0) {
+    return;
+  }
+  mvwaddnstr(win, row, col, text.c_str(), width);
+}
+
+void drawZenSectionHeader(WINDOW* win, int row, int col, int width,
+                          const std::string& title, int color_pair) {
+  if (!win || width <= 0) {
+    return;
+  }
+  const int title_width = static_cast<int>(title.size());
+  const int line_col = col + title_width + 1;
+  const int line_width = std::max(0, width - title_width - 2);
+
+  wattron(win, A_BOLD);
+  if (has_colors()) {
+    wattron(win, COLOR_PAIR(color_pair));
+  }
+  addClippedText(win, row, col, width, title);
+  if (has_colors()) {
+    wattroff(win, COLOR_PAIR(color_pair));
+  }
+  wattroff(win, A_BOLD);
+
+  if (line_width > 0) {
+    if (has_colors()) {
+      wattron(win, COLOR_PAIR(7));
+    }
+    mvwhline(win, row, line_col, ACS_HLINE, line_width);
+    if (has_colors()) {
+      wattroff(win, COLOR_PAIR(7));
+    }
+  }
+}
+
+std::string clippedText(const std::string& text, int width) {
+  if (width <= 0) {
+    return "";
+  }
+  if (static_cast<int>(text.size()) <= width) {
+    return text;
+  }
+  if (width <= 3) {
+    return text.substr(0, width);
+  }
+  return text.substr(0, width - 3) + "...";
+}
+
+std::string formatPercentText(double value) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << value << "%";
+  return out.str();
+}
+
+void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
+                   const std::vector<ProcessInfo>& processes) {
+  if (!win) return;
+
+  int max_y, max_x;
+  getmaxyx(win, max_y, max_x);
+
   erase();
 
-  int rows = 0;
-  int cols = 0;
+  const int margin = std::max(2, max_x / 40);
+  const int content_w = std::max(20, max_x - margin * 2);
+  int row = 1;
+
+  drawZenSectionHeader(win, row++, margin, content_w, "CPU Cores", 4);
+  row++;
+
+  if (!snapshot.cpu.core_usage_percent.empty()) {
+    const int item_width = 16;
+    const int item_gap = 2;
+    const int cores_per_row = std::max(1, (content_w + item_gap) / (item_width + item_gap));
+    const int grid_width = cores_per_row * item_width + (cores_per_row - 1) * item_gap;
+    const int grid_start = margin + std::max(0, (content_w - grid_width) / 2);
+
+    for (size_t i = 0; i < snapshot.cpu.core_usage_percent.size(); ++i) {
+      const int item_row = row + static_cast<int>(i / static_cast<size_t>(cores_per_row));
+      if (item_row >= max_y - 6) {
+        break;
+      }
+
+      const int col = grid_start + static_cast<int>(i % static_cast<size_t>(cores_per_row)) * (item_width + item_gap);
+      const double usage = snapshot.cpu.core_usage_percent[i];
+      const int color = colorPairForPercent(usage);
+      std::ostringstream label;
+      label << "C" << i;
+
+      if (has_colors()) {
+        wattron(win, COLOR_PAIR(color));
+      }
+      wattron(win, A_BOLD);
+      addClippedText(win, item_row, col, item_width, label.str());
+      wattroff(win, A_BOLD);
+      if (has_colors()) {
+        wattroff(win, COLOR_PAIR(color));
+      }
+
+      drawMiniBar(win, item_row, col + 3, usage, 7);
+
+      std::ostringstream pct;
+      pct << std::setw(4) << static_cast<int>(usage) << "%";
+      if (has_colors()) {
+        wattron(win, COLOR_PAIR(color));
+      }
+      addClippedText(win, item_row, col + 11, 5, pct.str());
+      if (has_colors()) {
+        wattroff(win, COLOR_PAIR(color));
+      }
+    }
+
+    row += static_cast<int>((snapshot.cpu.core_usage_percent.size() + static_cast<size_t>(cores_per_row) - 1) /
+                            static_cast<size_t>(cores_per_row));
+  } else {
+    addClippedText(win, row++, margin + 2, content_w - 4, "Core usage data unavailable");
+  }
+
+  row += 2;
+
+  const int column_gap = std::max(3, content_w / 30);
+  const int left_w = std::min(std::max(42, content_w / 3), content_w / 2);
+  const int right_w = content_w - left_w - column_gap;
+  const int left_x = margin;
+  const int right_x = left_x + left_w + column_gap;
+  int left_row = row;
+  int right_row = row;
+
+  auto drawSummaryBar = [&](int target_row, int col, int width, const std::string& label,
+                            double percent, const std::string& detail) {
+    const int label_width = 7;
+    const int pct_width = 7;
+    const int bar_width = std::max(8, std::min(16, width / 3));
+    const int detail_col = col + label_width + bar_width + pct_width + 4;
+
+    addClippedText(win, target_row, col, label_width, label);
+    drawMiniBar(win, target_row, col + label_width, percent, bar_width);
+
+    if (has_colors()) {
+      wattron(win, COLOR_PAIR(colorPairForPercent(percent)));
+    }
+    addClippedText(win, target_row, col + label_width + bar_width + 1, pct_width, formatPercentText(percent));
+    if (has_colors()) {
+      wattroff(win, COLOR_PAIR(colorPairForPercent(percent)));
+    }
+    addClippedText(win, target_row, detail_col, std::max(0, width - (detail_col - col)), detail);
+  };
+
+  if (config.show_gpu && !snapshot.gpus.empty()) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "GPU", 4);
+    left_row++;
+
+    for (size_t g = 0; g < snapshot.gpus.size() && left_row < max_y - 8; ++g) {
+      const auto& gpu = snapshot.gpus[g];
+      std::string title = clippedText(gpu.name, left_w - 2);
+      wattron(win, A_BOLD);
+      addClippedText(win, left_row, left_x, left_w, title);
+      wattroff(win, A_BOLD);
+
+      std::string source = "[" + gpu.source + "]";
+      if (gpu.in_use && *gpu.in_use) {
+        source += " (active)";
+      }
+      if (has_colors()) {
+        wattron(win, COLOR_PAIR(7));
+      }
+      addClippedText(win, left_row, left_x + static_cast<int>(title.size()) + 1,
+                     std::max(0, left_w - static_cast<int>(title.size()) - 1), source);
+      if (has_colors()) {
+        wattroff(win, COLOR_PAIR(7));
+      }
+      left_row++;
+
+      if (gpu.utilization_percent) {
+        drawSummaryBar(left_row++, left_x + 1, left_w - 2, "Util", *gpu.utilization_percent, "");
+      }
+      if (gpu.memory_utilization_percent) {
+        drawSummaryBar(left_row++, left_x + 1, left_w - 2, "VRAM", *gpu.memory_utilization_percent,
+                       formatGpuVramUsage(gpu));
+      }
+
+      std::vector<std::string> details;
+      if (gpu.temperature_c) {
+        details.push_back("Temp " + formatOptional(gpu.temperature_c, "C", 0));
+      }
+      if (gpu.power_w) {
+        details.push_back("Power " + formatOptional(gpu.power_w, "W", 0));
+      }
+      if (gpu.core_clock_mhz) {
+        if (*gpu.core_clock_mhz >= 1000.0) {
+          std::ostringstream out;
+          out << "Clock " << std::fixed << std::setprecision(2) << (*gpu.core_clock_mhz / 1000.0) << "GHz";
+          details.push_back(out.str());
+        } else {
+          std::ostringstream out;
+          out << "Clock " << std::fixed << std::setprecision(0) << *gpu.core_clock_mhz << "MHz";
+          details.push_back(out.str());
+        }
+      }
+      if (!details.empty()) {
+        std::string line;
+        for (size_t i = 0; i < details.size(); ++i) {
+          if (!line.empty()) {
+            line += "  |  ";
+          }
+          line += details[i];
+        }
+        addClippedText(win, left_row++, left_x + 1, left_w - 2, line);
+      }
+      left_row++;
+    }
+  }
+
+  drawZenSectionHeader(win, left_row++, left_x, left_w, "Memory & Storage", 2);
+  left_row++;
+
+  if (snapshot.ram.total_kb && snapshot.ram.available_kb && *snapshot.ram.total_kb > 0) {
+    const long long total_kb = *snapshot.ram.total_kb;
+    const long long available_kb = std::max(0LL, *snapshot.ram.available_kb);
+    const long long used_kb = total_kb - available_kb;
+    const double ram_pct = 100.0 * static_cast<double>(used_kb) / static_cast<double>(total_kb);
+    drawSummaryBar(left_row++, left_x, left_w, "RAM", ram_pct,
+                   humanBytes(static_cast<unsigned long long>(used_kb) * 1024ULL) + " / " +
+                       humanBytes(static_cast<unsigned long long>(total_kb) * 1024ULL));
+  }
+
+  if (const auto swap_pct = getSwapUsagePercent(); swap_pct && *swap_pct >= 0) {
+    drawSummaryBar(left_row++, left_x, left_w, "Swap", *swap_pct, formatPercentText(*swap_pct));
+  }
+
+  if (snapshot.disk.total_bytes && snapshot.disk.free_bytes && *snapshot.disk.total_bytes > 0) {
+    const auto total = *snapshot.disk.total_bytes;
+    const auto free = std::min(*snapshot.disk.free_bytes, total);
+    const auto used = total - free;
+    const double used_pct = 100.0 * static_cast<double>(used) / static_cast<double>(total);
+    drawSummaryBar(left_row++, left_x, left_w, "Disk", used_pct,
+                   humanBytes(used) + " / " + humanBytes(total));
+  }
+
+  drawZenSectionHeader(win, right_row++, right_x, right_w, "Top RAM Processes", 2);
+  right_row += 2;
+
+  std::vector<ProcessInfo> sorted_by_ram = processes;
+  std::sort(sorted_by_ram.begin(), sorted_by_ram.end(),
+            [](const ProcessInfo& a, const ProcessInfo& b) { return a.mem_percent > b.mem_percent; });
+
+  const int pid_col = right_x;
+  const int ram_col = pid_col + 10;
+  const int pct_col = ram_col + 12;
+  const int bar_col = pct_col + 7;
+  const int bar_width = std::max(8, std::min(14, right_w / 8));
+  const int cmd_col = bar_col + bar_width + 3;
+  const int cmd_width = std::max(10, right_x + right_w - cmd_col);
+  const int max_process_rows = std::max(3, max_y - right_row - 4);
+
+  wattron(win, A_BOLD);
+  addClippedText(win, right_row, pid_col, 8, "PID");
+  addClippedText(win, right_row, ram_col, 10, "RAM");
+  addClippedText(win, right_row, pct_col, 5, "%");
+  addClippedText(win, right_row, cmd_col, cmd_width, "COMMAND");
+  wattroff(win, A_BOLD);
+  right_row++;
+
+  long long total_ram_kb = snapshot.ram.total_kb.value_or(0);
+  for (int i = 0; i < static_cast<int>(sorted_by_ram.size()) && i < max_process_rows; ++i) {
+    const auto& proc = sorted_by_ram[static_cast<size_t>(i)];
+    const bool show_row_highlight =
+        proc.pid == config.lock_pid ||
+        (config.show_selection_highlight && config.lock_pid <= 0 && proc.pid == config.selected_pid);
+    const int color = colorPairForPercent(proc.mem_percent * 5.0);
+
+    if (show_row_highlight) {
+      if (has_colors()) {
+        wattron(win, COLOR_PAIR(5));
+      }
+      wattron(win, A_REVERSE);
+    }
+
+    std::ostringstream pid_str;
+    pid_str << std::setw(8) << proc.pid;
+    addClippedText(win, right_row, pid_col, 8, pid_str.str());
+
+    const long long proc_mem_kb = static_cast<long long>(proc.mem_percent * total_ram_kb / 100.0);
+    const double proc_mem_mb = static_cast<double>(proc_mem_kb) / 1024.0;
+    std::ostringstream mem_str;
+    if (proc_mem_mb >= 1024.0) {
+      mem_str << std::fixed << std::setprecision(1) << (proc_mem_mb / 1024.0) << "G";
+    } else {
+      mem_str << std::fixed << std::setprecision(0) << proc_mem_mb << "M";
+    }
+    if (has_colors()) {
+      wattron(win, COLOR_PAIR(color));
+    }
+    wattron(win, A_BOLD);
+    addClippedText(win, right_row, ram_col, 10, mem_str.str());
+    wattroff(win, A_BOLD);
+
+    addClippedText(win, right_row, pct_col, 6, formatPercentText(proc.mem_percent));
+    if (has_colors()) {
+      wattroff(win, COLOR_PAIR(color));
+    }
+
+    drawMiniBar(win, right_row, bar_col, proc.mem_percent * 5.0, bar_width);
+    addClippedText(win, right_row, cmd_col, cmd_width, clippedText(proc.command, cmd_width));
+
+    if (show_row_highlight) {
+      wattroff(win, A_REVERSE);
+      if (has_colors()) {
+        wattroff(win, COLOR_PAIR(5));
+      }
+    }
+
+    right_row++;
+  }
+
+  if (config.lock_pid > 0 && right_row < max_y - 2) {
+    right_row++;
+    if (has_colors()) {
+      wattron(win, COLOR_PAIR(4));
+    }
+    addClippedText(win, right_row, right_x, right_w, "Locked on PID " + std::to_string(config.lock_pid));
+    if (has_colors()) {
+      wattroff(win, COLOR_PAIR(4));
+    }
+  }
+
+  wnoutrefresh(win);
+}
+
+void drawHelpOverlay(WINDOW* overlay, const Config& config) {
+  if (!overlay) return;
+
+  int max_y = 0;
+  int max_x = 0;
+  getmaxyx(overlay, max_y, max_x);
+  (void)max_y;
+
+  box(overlay, ACS_VLINE, ACS_HLINE);
+
+  const std::string title = " Controls ";
+  mvwaddstr(overlay, 0, (max_x - title.size()) / 2, title.c_str());
+
+  int row = 2;
+  mvwaddstr(overlay, row++, 4, "q       Quit");
+  mvwaddstr(overlay, row++, 4, "?       Toggle help");
+  mvwaddstr(overlay, row++, 4, "z       Zen mode");
+  mvwaddstr(overlay, row++, 4, "s       Sort (CPU/MEM/GPU/PID)");
+  mvwaddstr(overlay, row++, 4, "j/k     Move selection");
+  mvwaddstr(overlay, row++, 4, "Up/Down Move selection");
+  mvwaddstr(overlay, row++, 4, "1-9     Jump to row");
+  if (config.lock_pid > 0) {
+    std::string pid_msg = "l/u     Toggle lock on PID " + std::to_string(config.lock_pid);
+    mvwaddstr(overlay, row++, 4, pid_msg.c_str());
+  } else if (config.selected_pid > 0) {
+    std::string pid_msg = "l       Lock PID " + std::to_string(config.selected_pid);
+    mvwaddstr(overlay, row++, 4, pid_msg.c_str());
+  } else {
+    mvwaddstr(overlay, row++, 4, "l       Lock selected PID");
+  }
+  mvwaddstr(overlay, row++, 4, "r       Refresh");
+  mvwaddstr(overlay, row++, 4, "+/-     Speed");
+  mvwaddstr(overlay, row++, 4, "Any key - Close help");
+
+  wnoutrefresh(overlay);
+}
+
+Snapshot collectSnapshot(const Config& config) {
+  Snapshot snapshot;
+  snapshot.cpu = collectCpuMetrics();
+  snapshot.ram = collectRam();
+  snapshot.disk = collectDisk("/");
+  snapshot.network = collectNetwork();
+  if (config.show_gpu) {
+    snapshot.gpus = collectGpus();
+  }
+  return snapshot;
+}
+
+void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
+                    const std::vector<ProcessInfo>& processes, const std::string& host,
+                    const Config& config, int refresh_interval_ms) {
+  erase();
+
+  int rows = 0, cols = 0;
   getmaxyx(stdscr, rows, cols);
 
   if (rows < 18 || cols < 80) {
     attron(A_BOLD);
-    attroff(A_BOLD);
     mvaddnstr(2, 2, "Terminal too small. Resize to at least 80x18.", std::max(0, cols - 4));
     mvaddnstr(3, 2, "Press q to quit.", std::max(0, cols - 4));
+    attroff(A_BOLD);
     refresh();
     return;
   }
 
-  attron(A_BOLD);
-  attroff(A_BOLD);
-  std::string header = "Host: " + host + "   Time: " + currentTimestamp();
-  mvaddnstr(1, 2, header.c_str(), cols - 4);
-  mvaddnstr(rows - 1, 2, "Press q to quit", cols - 4);
+  if (config.zen_mode) {
+    renderZenMode(stdscr, snapshot, config, processes);
+    doupdate();
+    return;
+  }
 
-  const int top = 3;
+  const std::string logo = " hmon " + std::string(version::kCurrent) + " ";
+  const std::string status = "Host: " + host + "  |  Refresh: " +
+                             (refresh_interval_ms >= 1000 ? std::to_string(refresh_interval_ms / 1000) + "s" :
+                                                            std::to_string(refresh_interval_ms) + "ms");
+  const std::string time_str = currentTimestamp();
+
+  attron(A_BOLD);
+  if (has_colors()) {
+    attron(COLOR_PAIR(4));
+    attron(A_REVERSE);
+  }
+  mvaddnstr(0, 0, logo.c_str(), static_cast<int>(logo.size()));
+  if (has_colors()) {
+    attroff(A_REVERSE);
+    attroff(COLOR_PAIR(4));
+  }
+  attroff(A_BOLD);
+
+  mvaddnstr(0, static_cast<int>(logo.size()) + 1, status.c_str(), cols - static_cast<int>(logo.size()) - static_cast<int>(time_str.size()) - 2);
+
+  if (has_colors()) {
+    attron(COLOR_PAIR(7));
+  }
+  mvaddnstr(0, cols - static_cast<int>(time_str.size()) - 1, time_str.c_str(), static_cast<int>(time_str.size()));
+  if (has_colors()) {
+    attroff(COLOR_PAIR(7));
+  }
+
+  for (int x = 0; x < cols; ++x) {
+    mvaddch(1, x, ACS_HLINE);
+  }
+
+  std::string shortcuts = " q:Quit  z:Zen  s:Sort  l:Lock  u:Unlock  +/-:Speed  r:Refresh  ?:Help ";
+  attron(A_REVERSE);
+  mvaddnstr(rows - 1, 0, shortcuts.c_str(), cols);
+  attroff(A_REVERSE);
+
+  const int top = 2;
   const int gap = 1;
   const int margin = 1;
   const int content_w = cols - 2 * margin - gap;
@@ -1144,22 +1952,19 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   const int content_h = rows - top - 2;
   const int history_min_h = std::max(6, estimateHistoryRows() / 2);
   const int min_panel_h = 4;
-  const int min_stack_h = min_panel_h * 2 + gap;
-  const int left_pref_top_h = estimateCpuRows(snapshot) + 2;
-  const int left_pref_bottom_h = estimateRamRows(snapshot) + 2;
-  const int right_pref_top_h = estimateGpuRows(snapshot) + 2;
-  const int right_pref_bottom_h = estimateDiskRows(snapshot) + 2;
+  const int min_stack_h = min_panel_h * 3 + gap * 2;
+  const int left_pref_top_h = estimateCpuRows(snapshot) + 1;
+  const int left_pref_bottom_h = estimateRamRows() + estimateNetworkRows() + gap + 1;
+  const int right_pref_top_h = config.show_gpu ? estimateGpuRows(snapshot) + 1 : 0;
+  const int right_pref_bottom_h = estimateDiskRows() + 1;
   const int pref_stack_h = std::max(left_pref_top_h + gap + left_pref_bottom_h,
                                     right_pref_top_h + gap + right_pref_bottom_h);
   const int stack_h = std::min(content_h, std::max(min_stack_h, pref_stack_h));
   const int remaining_h = content_h - stack_h;
-  const bool has_history_panel = remaining_h >= (history_min_h + gap);
+  const bool has_history_panel = config.show_history && remaining_h >= (history_min_h + gap);
   const int history_h = has_history_panel ? (remaining_h - gap) : 0;
 
-  int cpu_h = min_panel_h;
-  int ram_h = min_panel_h;
-  int gpu_h = min_panel_h;
-  int disk_h = min_panel_h;
+  int cpu_h = min_panel_h, ram_h = min_panel_h, gpu_h = min_panel_h, disk_h = min_panel_h;
   splitColumnHeights(stack_h, left_pref_top_h, left_pref_bottom_h, gap, &cpu_h, &ram_h);
   splitColumnHeights(stack_h, right_pref_top_h, right_pref_bottom_h, gap, &gpu_h, &disk_h);
 
@@ -1168,81 +1973,72 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   const Rect gpu_rect{top, x_right, gpu_h, right_w};
   const Rect disk_rect{top + gpu_h + gap, x_right, disk_h, right_w};
   const Rect history_rect{top + stack_h + gap, margin, history_h, cols - 2 * margin};
-  const Rect net_rect {top + ram_h + gap , x_left , ram_h , left_w};
+  const Rect net_rect{top + ram_h + gap, x_left, std::max(min_panel_h, content_h - cpu_h - ram_h - gap * 2), left_w};
+
   WINDOW* cpu_panel = createPanel(cpu_rect, "CPU");
   WINDOW* ram_panel = createPanel(ram_rect, "RAM");
-  WINDOW* gpu_panel = createPanel(gpu_rect, "GPU");
-  WINDOW* net_panel = createPanel(net_rect , "NET");
-  WINDOW* disk_panel = createPanel(disk_rect, "Disk");
-  WINDOW* history_panel = has_history_panel ? createPanel(history_rect, "Activity") : nullptr;
+  WINDOW* gpu_panel = config.show_gpu ? createPanel(gpu_rect, "GPU") : nullptr;
+  WINDOW* net_panel = createPanel(net_rect, "NETWORK");
+  WINDOW* disk_panel = createPanel(disk_rect, "DISK");
+  WINDOW* history_panel = has_history_panel ? createPanel(history_rect, "ACTIVITY HISTORY") : nullptr;
 
   renderCpuPanel(cpu_panel, snapshot);
   renderNetworkPanel(net_panel, snapshot);
   renderRamPanel(ram_panel, snapshot);
-  renderGpuPanel(gpu_panel, snapshot);
+  if (config.show_gpu) {
+    renderGpuPanel(gpu_panel, snapshot);
+  }
   renderDiskPanel(disk_panel, snapshot);
-  renderHistoryPanel(history_panel, history, processes);
+  if (has_history_panel) {
+    renderHistoryPanel(history_panel, history, processes, config.selected_pid, config.lock_pid,
+                       config.show_selection_highlight, config.sort_mode);
+  }
 
   wnoutrefresh(stdscr);
 
-  if (cpu_panel) {
-    wnoutrefresh(cpu_panel);
-    delwin(cpu_panel);
-  }
-  if (ram_panel) {
-    wnoutrefresh(ram_panel);
-    delwin(ram_panel);
-  }
-  if (gpu_panel) {
-    wnoutrefresh(gpu_panel);
-    delwin(gpu_panel);
-  }
-  if (net_panel) {
-    wnoutrefresh(net_panel);
-    delwin(net_panel);
-  }
-  if (disk_panel) {
-    wnoutrefresh(disk_panel);
-    delwin(disk_panel);
-  }
-  if (history_panel) {
-    wnoutrefresh(history_panel);
-    delwin(history_panel);
-  }
+  if (cpu_panel) { wnoutrefresh(cpu_panel); delwin(cpu_panel); }
+  if (ram_panel) { wnoutrefresh(ram_panel); delwin(ram_panel); }
+  if (gpu_panel) { wnoutrefresh(gpu_panel); delwin(gpu_panel); }
+  if (net_panel) { wnoutrefresh(net_panel); delwin(net_panel); }
+  if (disk_panel) { wnoutrefresh(disk_panel); delwin(disk_panel); }
+  if (history_panel) { wnoutrefresh(history_panel); delwin(history_panel); }
 
   doupdate();
 }
 
-Snapshot collectSnapshot() {
-  Snapshot snapshot;
-  snapshot.cpu = collectCpuMetrics();
-  snapshot.ram = collectRam();
-  snapshot.disk = collectDisk("/");
-  snapshot.network = collectNetwork();
-  snapshot.gpus = collectGpus();
-  return snapshot;
-}
+int main(int argc, char* argv[]) {
+  Config config = parseArgs(argc, argv);
 
-int main() {
+  if (config.cli_error) {
+    std::cerr << *config.cli_error << "\n\n";
+    printHelp(argv[0]);
+    return 1;
+  }
+
+  if (config.show_help) {
+    printHelp(argv[0]);
+    return 0;
+  }
+
+  if (config.show_version) {
+    printVersion();
+    return 0;
+  }
+
   std::setlocale(LC_ALL, "");
   initscr();
   cbreak();
   noecho();
   curs_set(0);
   keypad(stdscr, TRUE);
-  timeout(kFrameIntervalMs);
+  timeout(config.refresh_interval_ms);
 
-  if (has_colors()) {
+  if (has_colors() && config.show_colors) {
     start_color();
     use_default_colors();
     if (can_change_color() && COLORS >= 32) {
-      constexpr short kSoftGreen = 20;
-      constexpr short kSoftAmber = 21;
-      constexpr short kSoftRose = 22;
-      constexpr short kSoftCyan = 23;
-      constexpr short kSoftLavender = 24;
-      constexpr short kSoftBlue = 25;
-      constexpr short kSoftGray = 26;
+      constexpr short kSoftGreen = 20, kSoftAmber = 21, kSoftRose = 22;
+      constexpr short kSoftCyan = 23, kSoftLavender = 24, kSoftBlue = 25, kSoftGray = 26;
 
       init_color(kSoftGreen, 420, 760, 560);
       init_color(kSoftAmber, 780, 700, 430);
@@ -1260,9 +2056,9 @@ int main() {
       init_pair(6, kSoftBlue, -1);
       init_pair(7, kSoftGray, -1);
     } else {
-      init_pair(1, COLOR_CYAN, -1);
-      init_pair(2, COLOR_BLUE, -1);
-      init_pair(3, COLOR_MAGENTA, -1);
+      init_pair(1, COLOR_GREEN, -1);
+      init_pair(2, COLOR_YELLOW, -1);
+      init_pair(3, COLOR_RED, -1);
       init_pair(4, COLOR_CYAN, -1);
       init_pair(5, COLOR_MAGENTA, -1);
       init_pair(6, COLOR_BLUE, -1);
@@ -1272,21 +2068,143 @@ int main() {
 
   const std::string host = hostName();
   MetricsHistory history;
-  constexpr size_t kHistoryPoints = 2048;
-  constexpr size_t kProcessRows = 6;
-  Snapshot snapshot = collectSnapshot();
-  std::vector<ProcessInfo> processes = collectTopProcesses(kProcessRows);
-  updateHistory(&history, snapshot, kHistoryPoints, computeRootDiskBusyPercent());
-  renderSnapshot(snapshot, history, processes, host);
+  int refresh_interval_ms = config.refresh_interval_ms;
+  bool show_help_overlay = false;
+
+  Snapshot snapshot = collectSnapshot(config);
+  std::vector<ProcessInfo> processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+  syncSelection(processes, &config);
+  updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+  renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
 
   while (true) {
     const int ch = getch();
+
     if (ch == 'q' || ch == 'Q') {
       break;
     }
 
+    if (ch == '?') {
+      show_help_overlay = !show_help_overlay;
+      if (show_help_overlay) {
+        timeout(-1);
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int overlay_h = std::min(16, rows - 4);
+        int overlay_w = std::min(54, cols - 4);
+        int start_y = (rows - overlay_h) / 2;
+        int start_x = (cols - overlay_w) / 2;
+
+        WINDOW* help_win = newwin(overlay_h, overlay_w, start_y, start_x);
+        drawHelpOverlay(help_win, config);
+        delwin(help_win);
+        doupdate();
+      } else {
+        timeout(refresh_interval_ms);
+        renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      }
+      continue;
+    }
+
+    if (show_help_overlay && ch != ERR) {
+      show_help_overlay = false;
+      timeout(refresh_interval_ms);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
     if (ch == KEY_RESIZE) {
-      renderSnapshot(snapshot, history, processes, host);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'z' || ch == 'Z') {
+      config.zen_mode = !config.zen_mode;
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 's' || ch == 'S') {
+      switch (config.sort_mode) {
+        case SortMode::kCpu: config.sort_mode = SortMode::kMem; break;
+        case SortMode::kMem: config.sort_mode = SortMode::kGpu; break;
+        case SortMode::kGpu: config.sort_mode = SortMode::kPid; break;
+        case SortMode::kPid: config.sort_mode = SortMode::kCpu; break;
+      }
+      processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+      syncSelection(processes, &config);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == KEY_UP || ch == 'k' || ch == 'K') {
+      config.show_selection_highlight = true;
+      moveSelection(processes, &config, -1);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == KEY_DOWN || ch == 'j' || ch == 'J') {
+      config.show_selection_highlight = true;
+      moveSelection(processes, &config, 1);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'l' || ch == 'L') {
+      if (config.selected_pid > 0) {
+        if (config.lock_pid == config.selected_pid) {
+          config.lock_pid = -1;
+        } else {
+          config.lock_pid = config.selected_pid;
+        }
+      }
+      config.show_selection_highlight = false;
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'u' || ch == 'U') {
+      config.lock_pid = -1;
+      config.show_selection_highlight = false;
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch >= '1' && ch <= '9') {
+      int idx = ch - '1';
+      if (idx < static_cast<int>(processes.size())) {
+        config.selected_pid = processes[static_cast<size_t>(idx)].pid;
+        config.show_selection_highlight = true;
+        renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      }
+      continue;
+    }
+
+    if (ch == 'r' || ch == 'R') {
+      snapshot = collectSnapshot(config);
+      processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+      syncSelection(processes, &config);
+      updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == '+' || ch == '=') {
+      if (refresh_interval_ms > 100) {
+        refresh_interval_ms = std::max(100, refresh_interval_ms - 100);
+        timeout(refresh_interval_ms);
+        renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      }
+      continue;
+    }
+
+    if (ch == '-' || ch == '_') {
+      if (refresh_interval_ms < 10000) {
+        refresh_interval_ms = std::min(10000, refresh_interval_ms + 100);
+        timeout(refresh_interval_ms);
+        renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      }
       continue;
     }
 
@@ -1294,10 +2212,11 @@ int main() {
       continue;
     }
 
-    snapshot = collectSnapshot();
-    processes = collectTopProcesses(kProcessRows);
-    updateHistory(&history, snapshot, kHistoryPoints, computeRootDiskBusyPercent());
-    renderSnapshot(snapshot, history, processes, host);
+    snapshot = collectSnapshot(config);
+    processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+    syncSelection(processes, &config);
+    updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+    renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
   }
 
   endwin();
