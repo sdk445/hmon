@@ -9,16 +9,26 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(HMON_ENABLE_CLANG_TIDY "Run clang-tidy globally during C++ compilation" OFF)
 
-set(HMON_SOURCES
-  src/main.cpp
-  src/metrics/cpu.cpp
-  src/metrics/gpu.cpp
-  src/metrics/system.cpp
-  src/metrics/sensors_fallback.cpp
-  src/metrics/network.cpp
-)
+if(APPLE)
+  set(HMON_SOURCES
+    src/main.cpp
+    src/metrics/cpu_darwin.cpp
+    src/metrics/gpu_darwin.cpp
+    src/metrics/system_darwin.cpp
+  )
+  set(HMON_PLATFORM_LIBS)
+else()
+  set(HMON_SOURCES
+    src/main.cpp
+    src/metrics/cpu.cpp
+    src/metrics/gpu.cpp
+    src/metrics/system.cpp
+    src/metrics/sensors_fallback.cpp
+    src/metrics/network.cpp
+  )
+  set(HMON_PLATFORM_LIBS)
+endif()
 
-set(CURSES_NEED_WIDE TRUE)
 find_package(Curses REQUIRED)
 
 add_executable(hmon ${HMON_SOURCES})
@@ -27,12 +37,26 @@ target_include_directories(hmon PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
 find_library(NCURSESW_LIBRARY NAMES ncursesw)
 if(NCURSESW_LIBRARY)
   target_link_libraries(hmon PRIVATE ${NCURSESW_LIBRARY})
 else()
   target_link_libraries(hmon PRIVATE ${CURSES_LIBRARIES})
 endif()
+
+if(APPLE)
+  find_library(IOKIT_LIBRARY IOKit)
+  find_library(FOUNDATION_LIBRARY Foundation)
+  if(IOKIT_LIBRARY)
+    target_link_libraries(hmon PRIVATE ${IOKIT_LIBRARY})
+  endif()
+  if(FOUNDATION_LIBRARY)
+    target_link_libraries(hmon PRIVATE ${FOUNDATION_LIBRARY})
+  endif()
+endif()
+
+target_link_libraries(hmon PRIVATE ${HMON_PLATFORM_LIBS})
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hmon PRIVATE -Wall -Wextra -Wpedantic)
@@ -66,7 +90,6 @@ else()
   )
 endif()
 
-# Installation rules
 include(GNUInstallDirs)
 
 install(TARGETS hmon

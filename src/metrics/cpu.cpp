@@ -255,43 +255,110 @@ std::optional<double> collectCpuUsagePercent() {
   return std::max(0.0, std::min(100.0, usage));
 }
 
-}
-std::optional<fs::path> findCpuRaplEnergyPath() {
-  const fs::path base("/sys/class/powercap");
-  if (!fs::exists(base)) {
-    return std::nullopt;
+std::vector<double> collectPerCoreUsagePercent() {
+  std::vector<double> core_usage;
+
+  struct CoreState {
+    unsigned long long user = 0;
+    unsigned long long nice = 0;
+    unsigned long long system = 0;
+    unsigned long long idle = 0;
+    unsigned long long iowait = 0;
+    unsigned long long irq = 0;
+    unsigned long long softirq = 0;
+    unsigned long long steal = 0;
+    bool initialized = false;
+  };
+  static std::vector<CoreState> core_states;
+
+  std::ifstream stat("/proc/stat");
+  if (!stat) {
+    return core_usage;
   }
 
-  int best_score = -1;
-  std::optional<fs::path> best_path;
+  std::string line;
+  std::vector<std::array<unsigned long long, 8>> cpu_values;
 
-  for (const auto& entry : linux_utils::listDirEntries(base)) {
-    if (!fs::is_directory(entry)) {
-      continue;
-    }
-    const fs::path energy_file = entry / "energy_uj";
-    if (!fs::exists(energy_file)) {
+  while (std::getline(stat, line)) {
+    if (line.size() <= 3 || line[0] != 'c' || line[1] != 'p' || line[2] != 'u' || !std::isdigit(line[3])) {
       continue;
     }
 
-    const std::string domain_name = linux_utils::toLower(linux_utils::readFirstLine(entry / "name").value_or(""));
-    int score = 0;
-    if (domain_name.find("package") != std::string::npos) {
-      score += 100;
+    std::istringstream iss(line);
+    std::string cpu_tag;
+    iss >> cpu_tag;
+
+    std::array<unsigned long long, 8> values{};
+    bool valid = true;
+    for (int i = 0; i < 8; i++) {
+      if (!(iss >> values[i])) {
+        valid = false;
+        break;
+      }
     }
-    if (domain_name.find("cpu") != std::string::npos) {
-      score += 60;
-    }
-    if (domain_name.find("psys") != std::string::npos) {
-      score += 30;
-    }
-    if (score > best_score) {
-      best_score = score;
-      best_path = energy_file;
+
+    if (valid) {
+      cpu_values.push_back(values);
     }
   }
 
-  return best_path;
+  if (cpu_values.empty()) {
+    return core_usage;
+  }
+
+  if (core_states.size() != cpu_values.size()) {
+    core_states.resize(cpu_values.size());
+    for (size_t i = 0; i < cpu_values.size(); i++) {
+      core_states[i].user = cpu_values[i][0];
+      core_states[i].nice = cpu_values[i][1];
+      core_states[i].system = cpu_values[i][2];
+      core_states[i].idle = cpu_values[i][3];
+      core_states[i].iowait = cpu_values[i][4];
+      core_states[i].irq = cpu_values[i][5];
+      core_states[i].softirq = cpu_values[i][6];
+      core_states[i].steal = cpu_values[i][7];
+      core_states[i].initialized = true;
+    }
+    return core_usage;
+  }
+
+  core_usage.reserve(cpu_values.size());
+
+  for (size_t i = 0; i < cpu_values.size(); i++) {
+    const auto& values = cpu_values[i];
+    auto& state = core_states[i];
+
+    unsigned long long user_delta = values[0] - state.user;
+    unsigned long long nice_delta = values[1] - state.nice;
+    unsigned long long system_delta = values[2] - state.system;
+    unsigned long long idle_delta = values[3] - state.idle;
+    unsigned long long iowait_delta = values[4] - state.iowait;
+    unsigned long long irq_delta = values[5] - state.irq;
+    unsigned long long softirq_delta = values[6] - state.softirq;
+    unsigned long long steal_delta = values[7] - state.steal;
+
+    state.user = values[0];
+    state.nice = values[1];
+    state.system = values[2];
+    state.idle = values[3];
+    state.iowait = values[4];
+    state.irq = values[5];
+    state.softirq = values[6];
+    state.steal = values[7];
+
+    unsigned long long total_delta = user_delta + nice_delta + system_delta + idle_delta + 
+                                     iowait_delta + irq_delta + softirq_delta + steal_delta;
+    unsigned long long idle_total = idle_delta + iowait_delta;
+
+    if (total_delta == 0) {
+      core_usage.push_back(0.0);
+    } else {
+      double usage = 100.0 * (1.0 - static_cast<double>(idle_total) / static_cast<double>(total_delta));
+      core_usage.push_back(std::max(0.0, std::min(100.0, usage)));
+    }
+  }
+
+  return core_usage;
 }
 
 std::string collectName() {
@@ -465,6 +532,8 @@ std::optional<int> collectCoreCount() {
   return std::nullopt;
 }
 
+}
+
 CpuMetrics collectCpuMetrics() {
   CpuMetrics metrics;
   metrics.name = collectName();
@@ -476,5 +545,6 @@ CpuMetrics collectCpuMetrics() {
   metrics.temperature_c = collectCpuTemperature();
   metrics.frequency_mhz = collectCpuFrequency();
   metrics.usage_percent = collectCpuUsagePercent();
+  metrics.core_usage_percent = collectPerCoreUsagePercent();
   return metrics;
 }
