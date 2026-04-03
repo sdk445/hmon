@@ -66,7 +66,6 @@ int PluginManager::load(const std::string& so_path) {
 int PluginManager::load_directory(const std::string& dir) {
     DIR* dp = opendir(dir.c_str());
     if (!dp) {
-        std::cerr << "[hmon] cannot open plugin directory: " << dir << "\n";
         return 0;
     }
 
@@ -208,6 +207,18 @@ std::vector<std::string> PluginManager::plugin_names() const {
         names.push_back(p.name);
     }
     return names;
+}
+
+void PluginManager::control(const std::string& plugin_name, const char* key, int value) {
+    for (auto& plugin : plugins_) {
+        if (plugin.name == plugin_name) {
+            auto ctrl_fn = reinterpret_cast<hmon_plugin_control_fn>(dlsym(plugin.dl_handle, "hmon_plugin_control"));
+            if (ctrl_fn) {
+                ctrl_fn(key, value);
+            }
+            return;
+        }
+    }
 }
 
 } /* namespace hmon::core */

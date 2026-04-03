@@ -66,6 +66,9 @@ public:
     /* Return plugin names. */
     std::vector<std::string> plugin_names() const;
 
+    /* Send a control signal to a named plugin. */
+    void control(const std::string& plugin_name, const char* key, int value);
+
 private:
     std::vector<Plugin> plugins_;
 

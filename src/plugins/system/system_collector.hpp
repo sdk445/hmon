@@ -29,6 +29,8 @@ struct SystemPluginCtx {
 std::optional<long long> collectRamTotalKb();
 std::optional<long long> collectRamAvailableKb();
 std::optional<double> getSwapUsagePercent();
+std::optional<long long> getSwapTotalKb();
+std::optional<long long> getSwapFreeKb();
 
 std::string detectRootDevice();
 std::optional<unsigned long long> collectDiskTotalBytes(const std::string& mount);

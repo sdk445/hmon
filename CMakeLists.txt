@@ -2,13 +2,15 @@ cmake_minimum_required(VERSION 3.16)
 
 project(hmon LANGUAGES CXX VERSION 1.0.0)
 
-set(CMAKE_CXX_STANDARD 17)
+include(GNUInstallDirs)
+
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(HMON_ENABLE_CLANG_TIDY "Run clang-tidy globally during C++ compilation" OFF)
-option(HMON_PLUGIN_DIR "Directory where plugins are installed" "${CMAKE_INSTALL_LIBDIR}/hmon/plugins")
+set(HMON_PLUGIN_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/hmon/plugins" CACHE STRING "Directory where plugins are installed")
 
 # ── Core library (libhmoncore.so) ──────────────────────────────────────────
 
@@ -105,6 +107,24 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hmon_process PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Docker plugin
+add_library(hmon_docker SHARED
+  src/plugins/docker/docker_collector.cpp
+  src/plugins/docker/plugin.cpp
+)
+target_include_directories(hmon_docker PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/docker
+)
+set_target_properties(hmon_docker PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_docker PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # ── Main executable ───────────────────────────────────────────────────────
 
 find_package(Curses REQUIRED)
@@ -134,12 +154,11 @@ endif()
 # RPATH so the binary finds libhmoncore.so at runtime
 set_target_properties(hmon PROPERTIES
   INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
-  BUILD_RPATH "${CMAKE_BINARY_DIR}"
+  BUILD_RPATH "\$ORIGIN"
+  INSTALL_RPATH_USE_LINK_PATH ON
 )
 
 # ── Install rules ──────────────────────────────────────────────────────────
-
-include(GNUInstallDirs)
 
 install(TARGETS hmon
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -155,7 +174,7 @@ install(DIRECTORY include/hmon
 )
 
 # Install plugins to the plugin directory
-install(TARGETS hmon_cpu hmon_gpu hmon_system hmon_process
+install(TARGETS hmon_cpu hmon_gpu hmon_system hmon_process hmon_docker
   LIBRARY DESTINATION "${HMON_PLUGIN_DIR}"
 )
 
@@ -180,6 +199,7 @@ if(CLANG_TIDY_EXE)
     src/plugins/gpu/gpu_collector.cpp src/plugins/gpu/plugin.cpp
     src/plugins/system/system_collector.cpp src/plugins/system/plugin.cpp
     src/plugins/process/process_collector.cpp src/plugins/process/plugin.cpp
+    src/plugins/docker/docker_collector.cpp src/plugins/docker/plugin.cpp
   )
   add_custom_target(lint
     COMMAND ${CLANG_TIDY_EXE}

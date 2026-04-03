@@ -112,6 +112,10 @@ typedef void (*hmon_plugin_destroy_fn)(hmon_plugin_ctx* ctx);
  */
 typedef void (*hmon_plugin_free_list_fn)(hmon_metric_list* list);
 
+typedef void (*hmon_plugin_control_fn)(const char* key, int value);
+
+typedef void (*hmon_plugin_control_fn)(const char* key, int value);
+
 /* ── Helper macros for plugins ───────────────────────────────────────────── */
 
 #define HMON_PLUGIN_EXPORT __attribute__((visibility("default")))

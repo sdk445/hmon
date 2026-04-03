@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,6 +18,11 @@ struct CpuMetrics {
 struct RamMetrics {
   std::optional<long long> total_kb;
   std::optional<long long> available_kb;
+};
+
+struct SwapMetrics {
+  std::optional<long long> total_kb;
+  std::optional<long long> free_kb;
 };
 
 struct DiskMetrics {
@@ -54,11 +60,31 @@ struct ProcessInfo {
   std::string command;
 };
 
+struct DockerContainer {
+  std::string name;
+  std::string image;
+  std::string state;
+  double cpu_percent = 0.0;
+  uint64_t mem_usage = 0;
+  uint64_t mem_limit = 0;
+  double mem_percent = 0.0;
+  double net_rx_bps = 0.0;
+  double net_tx_bps = 0.0;
+  uint64_t net_rx_total = 0;
+  uint64_t net_tx_total = 0;
+  double blk_read_bps = 0.0;
+  double blk_write_bps = 0.0;
+  int pids_current = 0;
+};
+
 struct Snapshot {
   CpuMetrics cpu;
   RamMetrics ram;
+  SwapMetrics swap;
   DiskMetrics disk;
   NetworkMetrics network;
   std::vector<GpuMetrics> gpus;
   std::vector<ProcessInfo> processes;
+  std::vector<DockerContainer> docker_containers;
+  bool docker_loading = false;
 };

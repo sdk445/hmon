@@ -102,6 +102,34 @@ std::optional<double> getSwapUsagePercent() {
     return 100.0 * static_cast<double>(used) / static_cast<double>(total);
 }
 
+std::optional<long long> getSwapTotalKb() {
+    std::ifstream f("/proc/meminfo");
+    if (!f) return std::nullopt;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("SwapTotal:", 0) == 0) {
+            std::istringstream iss(line.substr(10));
+            long long total;
+            if (iss >> total) return total;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<long long> getSwapFreeKb() {
+    std::ifstream f("/proc/meminfo");
+    if (!f) return std::nullopt;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("SwapFree:", 0) == 0) {
+            std::istringstream iss(line.substr(9));
+            long long free;
+            if (iss >> free) return free;
+        }
+    }
+    return std::nullopt;
+}
+
 std::string detectRootDevice() {
     std::ifstream mounts("/proc/self/mounts");
     if (!mounts) return "sda";

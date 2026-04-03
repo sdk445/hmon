@@ -96,6 +96,18 @@ HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_lis
         appendMetric(out_list, HMON_METRIC_NET_TX_KBPS, HMON_VAL_DOUBLE, &v);
     }
 
+    /* Swap */
+    auto swap_total = hmon::plugins::system::getSwapTotalKb();
+    auto swap_free = hmon::plugins::system::getSwapFreeKb();
+    if (swap_total) {
+        int64_t v = *swap_total;
+        appendMetric(out_list, "swap.total_kb", HMON_VAL_INT64, &v);
+    }
+    if (swap_free) {
+        int64_t v = *swap_free;
+        appendMetric(out_list, "swap.free_kb", HMON_VAL_INT64, &v);
+    }
+
     return 0;
 }
 

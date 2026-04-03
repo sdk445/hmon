@@ -1392,12 +1392,19 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     const long long used_kb = total_kb - available_kb;
     const double ram_pct = 100.0 * static_cast<double>(used_kb) / static_cast<double>(total_kb);
     drawSummaryBar(left_row++, left_x, left_w, "RAM", ram_pct,
-                   humanBytes(static_cast<unsigned long long>(used_kb) * 1024ULL) + " / " +
-                       humanBytes(static_cast<unsigned long long>(total_kb) * 1024ULL));
+                   humanBytes(static_cast<unsigned long long>(used_kb) * 1024ULL));
   }
 
   if (const auto swap_pct = getSwapUsagePercent(); swap_pct && *swap_pct >= 0) {
-    drawSummaryBar(left_row++, left_x, left_w, "Swap", *swap_pct, formatPercentText(*swap_pct));
+    std::string swap_detail;
+    if (snapshot.swap.total_kb && snapshot.swap.free_kb) {
+      long long used_kb = *snapshot.swap.total_kb - *snapshot.swap.free_kb;
+      swap_detail = humanBytes(static_cast<unsigned long long>(used_kb) * 1024ULL) + " / " +
+                    humanBytes(static_cast<unsigned long long>(*snapshot.swap.total_kb) * 1024ULL);
+    } else {
+      swap_detail = formatPercentText(*swap_pct);
+    }
+    drawSummaryBar(left_row++, left_x, left_w, "Swap", *swap_pct, swap_detail);
   }
 
   if (snapshot.disk.total_bytes && snapshot.disk.free_bytes && *snapshot.disk.total_bytes > 0) {
@@ -1406,7 +1413,75 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     const auto used = total - free;
     const double used_pct = 100.0 * static_cast<double>(used) / static_cast<double>(total);
     drawSummaryBar(left_row++, left_x, left_w, "Disk", used_pct,
-                   humanBytes(used) + " / " + humanBytes(total));
+                   humanBytes(used));
+  }
+
+  if (!snapshot.network.interface.empty()) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "Network", 6);
+    left_row++;
+    char net_buf[128];
+    std::snprintf(net_buf, sizeof(net_buf), "Interface: %s", snapshot.network.interface.c_str());
+    addClippedText(win, left_row++, left_x + 1, left_w - 2, net_buf);
+    if (snapshot.network.rx_kbps) {
+      std::string rx_line = "RX: " + formatOptional(snapshot.network.rx_kbps, " KB/s", 1);
+      addClippedText(win, left_row++, left_x + 1, left_w - 2, rx_line);
+    }
+    if (snapshot.network.tx_kbps) {
+      std::string tx_line = "TX: " + formatOptional(snapshot.network.tx_kbps, " KB/s", 1);
+      addClippedText(win, left_row++, left_x + 1, left_w - 2, tx_line);
+    }
+    left_row++;
+  }
+
+  if (!snapshot.docker_containers.empty()) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "Docker", 1);
+    left_row++;
+
+    for (const auto& ct : snapshot.docker_containers) {
+      if (left_row >= max_y - 8) break;
+
+      wattron(win, A_BOLD);
+      std::string ct_header = clippedText(ct.name, left_w - 2);
+      addClippedText(win, left_row, left_x + 1, left_w - 2, ct_header);
+      wattroff(win, A_BOLD);
+
+      std::string img = "[" + clippedText(ct.image, left_w - 10) + "]";
+      if (has_colors()) {
+        wattron(win, COLOR_PAIR(7));
+      }
+      addClippedText(win, left_row, left_x + 1 + static_cast<int>(ct_header.size()) + 1,
+                     std::max(0, left_w - 2 - static_cast<int>(ct_header.size()) - 1), img);
+      if (has_colors()) {
+        wattroff(win, COLOR_PAIR(7));
+      }
+      left_row++;
+
+      if (left_row < max_y - 6) {
+        drawSummaryBar(left_row, left_x + 2, left_w - 4, "CPU", ct.cpu_percent, "");
+        left_row++;
+      }
+      if (left_row < max_y - 6) {
+        drawSummaryBar(left_row, left_x + 2, left_w - 4, "MEM", ct.mem_percent,
+                       humanBytes(ct.mem_usage));
+        left_row++;
+      }
+      if (left_row < max_y - 6 && (ct.net_rx_total > 0 || ct.net_tx_total > 0)) {
+        char net_total_buf[128];
+        std::snprintf(net_total_buf, sizeof(net_total_buf), "Total: ↓%s ↑%s",
+                      humanBytes(ct.net_rx_total).c_str(), humanBytes(ct.net_tx_total).c_str());
+        addClippedText(win, left_row++, left_x + 2, left_w - 4, net_total_buf);
+      }
+      if (left_row < max_y - 6 && ct.pids_current > 0) {
+        std::string pid_line = "PIDs: " + std::to_string(ct.pids_current);
+        addClippedText(win, left_row++, left_x + 2, left_w - 4, pid_line);
+      }
+      left_row++;
+    }
+  } else if (snapshot.docker_loading) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "Docker", 1);
+    left_row++;
+    addClippedText(win, left_row++, left_x + 1, left_w - 2, "Loading...");
+    left_row++;
   }
 
   drawZenSectionHeader(win, right_row++, right_x, right_w, "Top RAM Processes", 2);
@@ -1565,6 +1640,12 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   auto ram_avail = pm.get_int64(HMON_METRIC_RAM_AVAILABLE_KB);
   if (ram_avail) snapshot.ram.available_kb = *ram_avail;
 
+  /* Swap metrics from plugin */
+  auto swap_total = pm.get_int64("swap.total_kb");
+  if (swap_total) snapshot.swap.total_kb = *swap_total;
+  auto swap_free = pm.get_int64("swap.free_kb");
+  if (swap_free) snapshot.swap.free_kb = *swap_free;
+
   /* Disk metrics from plugin */
   snapshot.disk.mount_point = pm.get_string(HMON_METRIC_DISK_MOUNT, "/");
   auto disk_total = pm.get_int64(HMON_METRIC_DISK_TOTAL_BYTES);
@@ -1618,6 +1699,52 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
       }
     }
   }
+
+  /* Docker metrics from plugin */
+  auto docker_metrics = pm.get_by_prefix("docker.");
+  std::unordered_map<size_t, DockerContainer> docker_map;
+  for (const auto& m : docker_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "docker.%zu.", &idx) != 1) continue;
+
+    if (m.key.find(".name") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+      docker_map[idx].name = m.value.v.str;
+    } else if (m.key.find(".image") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+      docker_map[idx].image = m.value.v.str;
+    } else if (m.key.find(".state") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+      docker_map[idx].state = m.value.v.str;
+    } else if (m.key.find(".cpu_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].cpu_percent = m.value.v.f64;
+    } else if (m.key.find(".mem_usage") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      docker_map[idx].mem_usage = static_cast<uint64_t>(m.value.v.i64);
+    } else if (m.key.find(".mem_limit") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      docker_map[idx].mem_limit = static_cast<uint64_t>(m.value.v.i64);
+    } else if (m.key.find(".mem_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].mem_percent = m.value.v.f64;
+    } else if (m.key.find(".net_rx_bps") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].net_rx_bps = m.value.v.f64;
+    } else if (m.key.find(".net_tx_bps") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].net_tx_bps = m.value.v.f64;
+    } else if (m.key.find(".net_rx_total") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      docker_map[idx].net_rx_total = static_cast<uint64_t>(m.value.v.i64);
+    } else if (m.key.find(".net_tx_total") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      docker_map[idx].net_tx_total = static_cast<uint64_t>(m.value.v.i64);
+    } else if (m.key.find(".blk_read_bps") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].blk_read_bps = m.value.v.f64;
+    } else if (m.key.find(".blk_write_bps") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      docker_map[idx].blk_write_bps = m.value.v.f64;
+    } else if (m.key.find(".pids") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      docker_map[idx].pids_current = static_cast<int>(m.value.v.i64);
+    }
+  }
+
+  for (size_t i = 0; i < docker_map.size(); ++i) {
+    if (docker_map.count(i)) {
+      snapshot.docker_containers.push_back(docker_map[i]);
+    }
+  }
+
+  snapshot.docker_loading = snapshot.docker_containers.empty();
 
   return snapshot;
 }
@@ -1849,6 +1976,31 @@ int main(int argc, char* argv[]) {
   }
 
   std::setlocale(LC_ALL, "");
+
+  /* Load plugins BEFORE ncurses so errors don't corrupt the display */
+  hmon::core::PluginManager pm;
+
+  const char* env_plugin_dir = std::getenv("HMON_PLUGIN_DIR");
+  if (env_plugin_dir) {
+    pm.load_directory(env_plugin_dir);
+  } else {
+    /* Try build directory first (for development), then install path */
+    pm.load_directory("./");
+    if (pm.plugin_count() == 0) {
+      pm.load_directory(HMON_PLUGIN_DIR);
+    }
+  }
+
+  if (pm.plugin_count() == 0) {
+    std::cerr << "hmon: no plugins found. Set HMON_PLUGIN_DIR or run from build directory.\n";
+    return 1;
+  }
+
+  if (pm.init_all() != 0) {
+    std::cerr << "hmon: failed to initialise one or more plugins.\n";
+    return 1;
+  }
+
   initscr();
   cbreak();
   noecho();
@@ -1888,40 +2040,6 @@ int main(int argc, char* argv[]) {
       init_pair(7, COLOR_WHITE, -1);
     }
   }
-
-  /* Load plugins dynamically */
-  hmon::core::PluginManager pm;
-
-  /* Try to load from the install directory first, then fall back to build dir */
-  const char* env_plugin_dir = std::getenv("HMON_PLUGIN_DIR");
-  if (env_plugin_dir) {
-    pm.load_directory(env_plugin_dir);
-  } else {
-    pm.load_directory(HMON_PLUGIN_DIR);
-    if (pm.plugin_count() == 0) {
-      pm.load_directory("./");
-    }
-  }
-
-  if (pm.plugin_count() == 0) {
-    endwin();
-    std::cerr << "hmon: no plugins found. Set HMON_PLUGIN_DIR or install plugins.\n";
-    return 1;
-  }
-
-  if (pm.init_all() != 0) {
-    endwin();
-    std::cerr << "hmon: failed to initialise one or more plugins.\n";
-    return 1;
-  }
-
-  std::cout << "hmon: loaded " << pm.plugin_count() << " plugin(s): ";
-  auto names = pm.plugin_names();
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (i > 0) std::cout << ", ";
-    std::cout << names[i];
-  }
-  std::cout << "\n";
 
   const std::string host = hostName();
   MetricsHistory history;
@@ -1978,6 +2096,7 @@ int main(int argc, char* argv[]) {
 
     if (ch == 'z' || ch == 'Z') {
       config.zen_mode = !config.zen_mode;
+      pm.control("docker", "docker.enable", config.zen_mode ? 1 : 0);
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
       continue;
     }
