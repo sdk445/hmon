@@ -77,6 +77,45 @@ struct DockerContainer {
   int pids_current = 0;
 };
 
+struct ListeningPort {
+  uint16_t port = 0;
+  std::string proto;
+  std::string addr;
+  int pid = -1;
+  std::string process;
+};
+
+struct ServiceInfo {
+  std::string name;
+  std::string state;
+  std::string sub_state;
+  std::string description;
+};
+
+struct DbInfo {
+  std::string type;
+  std::string status;
+  int active_connections = 0;
+  int max_connections = 0;
+  int64_t uptime_seconds = 0;
+  std::string version;
+};
+
+struct WebServerInfo {
+  std::string type;
+  std::string status;
+  int active_connections = 0;
+  double requests_per_sec = 0.0;
+  int64_t total_requests = 0;
+};
+
+struct CronJob {
+  std::string schedule;
+  std::string user;
+  std::string command;
+  std::string source;
+};
+
 struct Snapshot {
   CpuMetrics cpu;
   RamMetrics ram;
@@ -87,4 +126,9 @@ struct Snapshot {
   std::vector<ProcessInfo> processes;
   std::vector<DockerContainer> docker_containers;
   bool docker_loading = false;
+  std::vector<ListeningPort> ports;
+  std::vector<ServiceInfo> services;
+  std::vector<DbInfo> databases;
+  std::vector<WebServerInfo> webservers;
+  std::vector<CronJob> cron_jobs;
 };

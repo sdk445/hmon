@@ -125,6 +125,96 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hmon_docker PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Ports plugin
+add_library(hmon_ports SHARED
+  src/plugins/ports/ports_collector.cpp
+  src/plugins/ports/plugin.cpp
+)
+target_include_directories(hmon_ports PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/ports
+)
+set_target_properties(hmon_ports PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_ports PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Systemd plugin
+add_library(hmon_systemd SHARED
+  src/plugins/systemd/systemd_collector.cpp
+  src/plugins/systemd/plugin.cpp
+)
+target_include_directories(hmon_systemd PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/systemd
+)
+set_target_properties(hmon_systemd PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_systemd PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Database plugin
+add_library(hmon_database SHARED
+  src/plugins/database/database_collector.cpp
+  src/plugins/database/plugin.cpp
+)
+target_include_directories(hmon_database PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/database
+)
+set_target_properties(hmon_database PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_database PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Webserver plugin
+add_library(hmon_webserver SHARED
+  src/plugins/webserver/webserver_collector.cpp
+  src/plugins/webserver/plugin.cpp
+)
+target_include_directories(hmon_webserver PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/webserver
+)
+set_target_properties(hmon_webserver PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_webserver PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Cron plugin
+add_library(hmon_cron SHARED
+  src/plugins/cron/cron_collector.cpp
+  src/plugins/cron/plugin.cpp
+)
+target_include_directories(hmon_cron PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/cron
+)
+set_target_properties(hmon_cron PROPERTIES
+  PREFIX "lib"
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(hmon_cron PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # ── Main executable ───────────────────────────────────────────────────────
 
 find_package(Curses REQUIRED)
@@ -174,7 +264,7 @@ install(DIRECTORY include/hmon
 )
 
 # Install plugins to the plugin directory
-install(TARGETS hmon_cpu hmon_gpu hmon_system hmon_process hmon_docker
+install(TARGETS hmon_cpu hmon_gpu hmon_system hmon_process hmon_docker hmon_ports hmon_systemd hmon_database hmon_webserver hmon_cron
   LIBRARY DESTINATION "${HMON_PLUGIN_DIR}"
 )
 
@@ -200,6 +290,11 @@ if(CLANG_TIDY_EXE)
     src/plugins/system/system_collector.cpp src/plugins/system/plugin.cpp
     src/plugins/process/process_collector.cpp src/plugins/process/plugin.cpp
     src/plugins/docker/docker_collector.cpp src/plugins/docker/plugin.cpp
+    src/plugins/ports/ports_collector.cpp src/plugins/ports/plugin.cpp
+    src/plugins/systemd/systemd_collector.cpp src/plugins/systemd/plugin.cpp
+    src/plugins/database/database_collector.cpp src/plugins/database/plugin.cpp
+    src/plugins/webserver/webserver_collector.cpp src/plugins/webserver/plugin.cpp
+    src/plugins/cron/cron_collector.cpp src/plugins/cron/plugin.cpp
   )
   add_custom_target(lint
     COMMAND ${CLANG_TIDY_EXE}

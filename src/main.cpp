@@ -110,6 +110,7 @@ std::optional<double> getSwapUsagePercent() {
 }
 
 enum class SortMode { kCpu, kMem, kGpu, kPid };
+enum class ZenFocus { kNone, kPorts, kServices, kDocker };
 
 struct Config {
   int refresh_interval_ms = 1000;
@@ -125,6 +126,10 @@ struct Config {
   bool show_help = false;
   bool show_version = false;
   bool show_selection_highlight = false;
+  int zen_docker_scroll = 0;
+  int zen_ports_scroll = 0;
+  int zen_services_scroll = 0;
+  ZenFocus zen_focus = ZenFocus::kNone;
   std::optional<std::string> cli_error;
 };
 
@@ -1434,11 +1439,25 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
   }
 
   if (!snapshot.docker_containers.empty()) {
-    drawZenSectionHeader(win, left_row++, left_x, left_w, "Docker", 1);
+    bool focused = (config.zen_focus == ZenFocus::kDocker);
+    if (focused) {
+      if (has_colors()) wattron(win, COLOR_PAIR(4));
+      wattron(win, A_BOLD);
+    }
+    drawZenSectionHeader(win, left_row++, left_x, left_w, focused ? "> Docker" : "Docker", 1);
+    if (focused) {
+      wattroff(win, A_BOLD);
+      if (has_colors()) wattroff(win, COLOR_PAIR(4));
+    }
     left_row++;
 
-    for (const auto& ct : snapshot.docker_containers) {
-      if (left_row >= max_y - 8) break;
+    int max_show = 4;
+    int total = static_cast<int>(snapshot.docker_containers.size());
+    int start = focused ? std::max(0, std::min(config.zen_docker_scroll, total - max_show)) : 0;
+    int shown = 0;
+    for (int i = start; i < total && shown < max_show; ++i) {
+      if (left_row >= max_y - 4) break;
+      const auto& ct = snapshot.docker_containers[static_cast<size_t>(i)];
 
       wattron(win, A_BOLD);
       std::string ct_header = clippedText(ct.name, left_w - 2);
@@ -1456,32 +1475,182 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
       }
       left_row++;
 
-      if (left_row < max_y - 6) {
+      if (left_row < max_y - 4) {
         drawSummaryBar(left_row, left_x + 2, left_w - 4, "CPU", ct.cpu_percent, "");
         left_row++;
       }
-      if (left_row < max_y - 6) {
+      if (left_row < max_y - 4) {
         drawSummaryBar(left_row, left_x + 2, left_w - 4, "MEM", ct.mem_percent,
                        humanBytes(ct.mem_usage));
         left_row++;
       }
-      if (left_row < max_y - 6 && (ct.net_rx_total > 0 || ct.net_tx_total > 0)) {
+      if (left_row < max_y - 4 && (ct.net_rx_total > 0 || ct.net_tx_total > 0)) {
         char net_total_buf[128];
         std::snprintf(net_total_buf, sizeof(net_total_buf), "Total: ↓%s ↑%s",
                       humanBytes(ct.net_rx_total).c_str(), humanBytes(ct.net_tx_total).c_str());
         addClippedText(win, left_row++, left_x + 2, left_w - 4, net_total_buf);
       }
-      if (left_row < max_y - 6 && ct.pids_current > 0) {
+      if (left_row < max_y - 4 && ct.pids_current > 0) {
         std::string pid_line = "PIDs: " + std::to_string(ct.pids_current);
         addClippedText(win, left_row++, left_x + 2, left_w - 4, pid_line);
       }
       left_row++;
+      ++shown;
+    }
+    if (total > max_show) {
+      char info[64];
+      std::snprintf(info, sizeof(info), "  [%d-%d/%d] j/k scroll", start + 1, start + shown, total);
+      if (focused && has_colors()) wattron(win, COLOR_PAIR(4));
+      addClippedText(win, left_row++, left_x + 1, left_w - 2, info);
+      if (focused && has_colors()) wattroff(win, COLOR_PAIR(4));
     }
   } else if (snapshot.docker_loading) {
     drawZenSectionHeader(win, left_row++, left_x, left_w, "Docker", 1);
     left_row++;
     addClippedText(win, left_row++, left_x + 1, left_w - 2, "Loading...");
     left_row++;
+  }
+
+  /* Databases — left column */
+  if (!snapshot.databases.empty()) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "Databases", 2);
+    left_row++;
+    for (const auto& d : snapshot.databases) {
+      if (left_row >= max_y - 4) break;
+      if (d.status == "running") {
+        char line[128];
+        std::snprintf(line, sizeof(line), "  %-12s %d/%d conns",
+                      d.type.c_str(), d.active_connections,
+                      d.max_connections > 0 ? d.max_connections : d.active_connections);
+        addClippedText(win, left_row++, left_x + 1, left_w - 2, line);
+      } else {
+        char line[64];
+        std::snprintf(line, sizeof(line), "  %-12s stopped", d.type.c_str());
+        if (has_colors()) wattron(win, COLOR_PAIR(3));
+        addClippedText(win, left_row++, left_x + 1, left_w - 2, line);
+        if (has_colors()) wattroff(win, COLOR_PAIR(3));
+      }
+    }
+    left_row++;
+  }
+
+  /* Cron jobs — left column */
+  if (!snapshot.cron_jobs.empty()) {
+    drawZenSectionHeader(win, left_row++, left_x, left_w, "Cron", 7);
+    left_row++;
+    int shown = 0;
+    for (const auto& c : snapshot.cron_jobs) {
+      if (left_row >= max_y - 4 || shown >= 5) break;
+      char line[256];
+      std::string cmd = c.command;
+      if (cmd.size() > 45) cmd = cmd.substr(0, 42) + "...";
+      std::snprintf(line, sizeof(line), "  %-14s %s", c.schedule.c_str(), cmd.c_str());
+      addClippedText(win, left_row++, left_x + 1, left_w - 2, line);
+      ++shown;
+    }
+    left_row++;
+  }
+
+  /* Right column — Ports, Services, Web, Processes */
+
+  /* Ports — scrollable */
+  if (!snapshot.ports.empty()) {
+    bool focused = (config.zen_focus == ZenFocus::kPorts);
+    if (focused) {
+      if (has_colors()) wattron(win, COLOR_PAIR(4));
+      wattron(win, A_BOLD);
+    }
+    drawZenSectionHeader(win, right_row++, right_x, right_w, focused ? "> Ports" : "Ports", 6);
+    if (focused) {
+      wattroff(win, A_BOLD);
+      if (has_colors()) wattroff(win, COLOR_PAIR(4));
+    }
+    right_row++;
+    int max_show = 6;
+    int total = static_cast<int>(snapshot.ports.size());
+    int start = focused ? std::max(0, std::min(config.zen_ports_scroll, total - max_show)) : 0;
+    int shown = 0;
+    for (int i = start; i < total && shown < max_show; ++i) {
+      if (right_row >= max_y - 4) break;
+      const auto& p = snapshot.ports[static_cast<size_t>(i)];
+      char line[128];
+      std::snprintf(line, sizeof(line), "  %-5d %-4s %s",
+                    p.port, p.proto.c_str(),
+                    p.process.empty() ? "?" : p.process.c_str());
+      if (focused && has_colors()) wattron(win, COLOR_PAIR(4));
+      addClippedText(win, right_row++, right_x, right_w - 1, line);
+      if (focused && has_colors()) wattroff(win, COLOR_PAIR(4));
+      ++shown;
+    }
+    if (total > max_show) {
+      char info[64];
+      std::snprintf(info, sizeof(info), "  [%d-%d/%d] j/k scroll", start + 1, start + shown, total);
+      if (focused && has_colors()) wattron(win, COLOR_PAIR(4));
+      addClippedText(win, right_row++, right_x, right_w - 1, info);
+      if (focused && has_colors()) wattroff(win, COLOR_PAIR(4));
+    }
+    right_row++;
+  }
+
+  /* Services — scrollable */
+  if (!snapshot.services.empty()) {
+    bool focused = (config.zen_focus == ZenFocus::kServices);
+    if (focused) {
+      if (has_colors()) wattron(win, COLOR_PAIR(4));
+      wattron(win, A_BOLD);
+    }
+    drawZenSectionHeader(win, right_row++, right_x, right_w, focused ? "> Services" : "Services", 4);
+    if (focused) {
+      wattroff(win, A_BOLD);
+      if (has_colors()) wattroff(win, COLOR_PAIR(4));
+    }
+    right_row++;
+    int max_show = 6;
+    int total = static_cast<int>(snapshot.services.size());
+    int start = focused ? std::max(0, std::min(config.zen_services_scroll, total - max_show)) : 0;
+    int shown = 0;
+    for (int i = start; i < total && shown < max_show; ++i) {
+      if (right_row >= max_y - 4) break;
+      const auto& s = snapshot.services[static_cast<size_t>(i)];
+      char line[128];
+      const char* dot = (s.state == "failed") ? "!!" : "  ";
+      int color = (s.state == "failed") ? 3 : (focused ? 4 : 1);
+      std::snprintf(line, sizeof(line), "%s %-16s %s", dot, s.name.c_str(), s.sub_state.c_str());
+      if (has_colors()) wattron(win, COLOR_PAIR(color));
+      addClippedText(win, right_row++, right_x, right_w - 1, line);
+      if (has_colors()) wattroff(win, COLOR_PAIR(color));
+      ++shown;
+    }
+    if (total > max_show) {
+      char info[64];
+      std::snprintf(info, sizeof(info), "  [%d-%d/%d] j/k scroll", start + 1, start + shown, total);
+      if (focused && has_colors()) wattron(win, COLOR_PAIR(4));
+      addClippedText(win, right_row++, right_x, right_w - 1, info);
+      if (focused && has_colors()) wattroff(win, COLOR_PAIR(4));
+    }
+    right_row++;
+  }
+
+  /* Web servers */
+  if (!snapshot.webservers.empty()) {
+    drawZenSectionHeader(win, right_row++, right_x, right_w, "Web", 4);
+    right_row++;
+    for (const auto& w : snapshot.webservers) {
+      if (right_row >= max_y - 4) break;
+      if (w.status == "running") {
+        char line[128];
+        std::snprintf(line, sizeof(line), "  %-8s %d active  %.0f r/s",
+                      w.type.c_str(), w.active_connections, w.requests_per_sec);
+        addClippedText(win, right_row++, right_x, right_w - 1, line);
+      } else {
+        char line[64];
+        std::snprintf(line, sizeof(line), "  %-8s stopped", w.type.c_str());
+        if (has_colors()) wattron(win, COLOR_PAIR(3));
+        addClippedText(win, right_row++, right_x, right_w - 1, line);
+        if (has_colors()) wattroff(win, COLOR_PAIR(3));
+      }
+    }
+    right_row++;
   }
 
   drawZenSectionHeader(win, right_row++, right_x, right_w, "Top RAM Processes", 2);
@@ -1745,6 +1914,104 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   }
 
   snapshot.docker_loading = snapshot.docker_containers.empty();
+
+  /* Ports */
+  auto port_metrics = pm.get_by_prefix("ports.");
+  std::unordered_map<size_t, ListeningPort> port_map;
+  for (const auto& m : port_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "ports.%zu.", &idx) != 1) continue;
+    if (m.key.find(".port") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      port_map[idx].port = static_cast<uint16_t>(m.value.v.i64);
+    else if (m.key.find(".proto") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      port_map[idx].proto = m.value.v.str;
+    else if (m.key.find(".addr") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      port_map[idx].addr = m.value.v.str;
+    else if (m.key.find(".pid") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      port_map[idx].pid = static_cast<int>(m.value.v.i64);
+    else if (m.key.find(".process") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      port_map[idx].process = m.value.v.str;
+  }
+  for (size_t i = 0; i < port_map.size(); ++i)
+    if (port_map.count(i)) snapshot.ports.push_back(port_map[i]);
+
+  /* Systemd services */
+  auto svc_metrics = pm.get_by_prefix("systemd.");
+  std::unordered_map<size_t, ServiceInfo> svc_map;
+  for (const auto& m : svc_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "systemd.%zu.", &idx) != 1) continue;
+    if (m.key.find(".name") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      svc_map[idx].name = m.value.v.str;
+    else if (m.key.find(".state") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      svc_map[idx].state = m.value.v.str;
+    else if (m.key.find(".sub") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      svc_map[idx].sub_state = m.value.v.str;
+    else if (m.key.find(".desc") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      svc_map[idx].description = m.value.v.str;
+  }
+  for (size_t i = 0; i < svc_map.size(); ++i)
+    if (svc_map.count(i)) snapshot.services.push_back(svc_map[i]);
+
+  /* Databases */
+  auto db_metrics = pm.get_by_prefix("db.");
+  std::unordered_map<size_t, DbInfo> db_map;
+  for (const auto& m : db_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "db.%zu.", &idx) != 1) continue;
+    if (m.key.find(".type") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      db_map[idx].type = m.value.v.str;
+    else if (m.key.find(".status") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      db_map[idx].status = m.value.v.str;
+    else if (m.key.find(".active_conns") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      db_map[idx].active_connections = static_cast<int>(m.value.v.i64);
+    else if (m.key.find(".max_conns") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      db_map[idx].max_connections = static_cast<int>(m.value.v.i64);
+    else if (m.key.find(".uptime") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      db_map[idx].uptime_seconds = m.value.v.i64;
+    else if (m.key.find(".version") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      db_map[idx].version = m.value.v.str;
+  }
+  for (size_t i = 0; i < db_map.size(); ++i)
+    if (db_map.count(i)) snapshot.databases.push_back(db_map[i]);
+
+  /* Web servers */
+  auto ws_metrics = pm.get_by_prefix("web.");
+  std::unordered_map<size_t, WebServerInfo> ws_map;
+  for (const auto& m : ws_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "web.%zu.", &idx) != 1) continue;
+    if (m.key.find(".type") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      ws_map[idx].type = m.value.v.str;
+    else if (m.key.find(".status") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      ws_map[idx].status = m.value.v.str;
+    else if (m.key.find(".active_conns") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      ws_map[idx].active_connections = static_cast<int>(m.value.v.i64);
+    else if (m.key.find(".rps") != std::string::npos && m.value.type == HMON_VAL_DOUBLE)
+      ws_map[idx].requests_per_sec = m.value.v.f64;
+    else if (m.key.find(".total_req") != std::string::npos && m.value.type == HMON_VAL_INT64)
+      ws_map[idx].total_requests = m.value.v.i64;
+  }
+  for (size_t i = 0; i < ws_map.size(); ++i)
+    if (ws_map.count(i)) snapshot.webservers.push_back(ws_map[i]);
+
+  /* Cron jobs */
+  auto cron_metrics = pm.get_by_prefix("cron.");
+  std::unordered_map<size_t, CronJob> cron_map;
+  for (const auto& m : cron_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "cron.%zu.", &idx) != 1) continue;
+    if (m.key.find(".schedule") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      cron_map[idx].schedule = m.value.v.str;
+    else if (m.key.find(".user") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      cron_map[idx].user = m.value.v.str;
+    else if (m.key.find(".command") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      cron_map[idx].command = m.value.v.str;
+    else if (m.key.find(".source") != std::string::npos && m.value.type == HMON_VAL_STRING)
+      cron_map[idx].source = m.value.v.str;
+  }
+  for (size_t i = 0; i < cron_map.size(); ++i)
+    if (cron_map.count(i)) snapshot.cron_jobs.push_back(cron_map[i]);
 
   return snapshot;
 }
@@ -2096,7 +2363,56 @@ int main(int argc, char* argv[]) {
 
     if (ch == 'z' || ch == 'Z') {
       config.zen_mode = !config.zen_mode;
-      pm.control("docker", "docker.enable", config.zen_mode ? 1 : 0);
+      if (config.zen_mode) {
+        pm.control("docker", "docker.enable", 1);
+        config.zen_docker_scroll = 0;
+        config.zen_ports_scroll = 0;
+        config.zen_services_scroll = 0;
+        config.zen_focus = ZenFocus::kNone;
+      } else {
+        pm.control("docker", "docker.enable", 0);
+      }
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.zen_mode && ch == 9) { /* Tab — cycle focus */
+      std::vector<ZenFocus> available;
+      if (!snapshot.docker_containers.empty()) available.push_back(ZenFocus::kDocker);
+      if (!snapshot.ports.empty()) available.push_back(ZenFocus::kPorts);
+      if (!snapshot.services.empty()) available.push_back(ZenFocus::kServices);
+      if (available.empty()) { config.zen_focus = ZenFocus::kNone; }
+      else {
+        auto it = std::find(available.begin(), available.end(), config.zen_focus);
+        if (it == available.end() || it + 1 == available.end()) config.zen_focus = available.front();
+        else config.zen_focus = *(it + 1);
+      }
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.zen_mode && (ch == 'j' || ch == 'J' || ch == KEY_DOWN)) {
+      if (config.zen_focus == ZenFocus::kDocker && !snapshot.docker_containers.empty()) {
+        int max_show = 4;
+        int total = static_cast<int>(snapshot.docker_containers.size());
+        config.zen_docker_scroll = std::min(config.zen_docker_scroll + 1, std::max(0, total - max_show));
+      } else if (config.zen_focus == ZenFocus::kPorts && !snapshot.ports.empty()) {
+        int max_show = 6;
+        int total = static_cast<int>(snapshot.ports.size());
+        config.zen_ports_scroll = std::min(config.zen_ports_scroll + 1, std::max(0, total - max_show));
+      } else if (config.zen_focus == ZenFocus::kServices && !snapshot.services.empty()) {
+        int max_show = 6;
+        int total = static_cast<int>(snapshot.services.size());
+        config.zen_services_scroll = std::min(config.zen_services_scroll + 1, std::max(0, total - max_show));
+      }
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.zen_mode && (ch == 'k' || ch == 'K' || ch == KEY_UP)) {
+      config.zen_docker_scroll = std::max(0, config.zen_docker_scroll - 1);
+      config.zen_ports_scroll = std::max(0, config.zen_ports_scroll - 1);
+      config.zen_services_scroll = std::max(0, config.zen_services_scroll - 1);
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
       continue;
     }
