@@ -10,14 +10,14 @@
 namespace hmon::plugins::system {
 
 struct SystemPluginCtx {
-    /* Network state */
+
     unsigned long long prev_rx_bytes = 0;
     unsigned long long prev_tx_bytes = 0;
     bool net_initialized = false;
     std::chrono::steady_clock::time_point prev_net_time;
     std::string active_interface;
 
-    /* Disk state */
+
     unsigned long long prev_read_sectors = 0;
     unsigned long long prev_write_sectors = 0;
     unsigned long long prev_io_time = 0;

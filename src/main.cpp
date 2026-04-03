@@ -704,6 +704,7 @@ void drawBrailleLayer(WINDOW* win, const BrailleCanvas& canvas, int top, int lef
 }
 
 std::optional<double> computeRootDiskBusyPercent() {
+#ifdef __APPLE__
   static std::optional<unsigned long long> previous_read_ops;
   static std::optional<unsigned long long> previous_write_ops;
   static std::chrono::steady_clock::time_point previous_time;
@@ -759,6 +760,9 @@ std::optional<double> computeRootDiskBusyPercent() {
   const double busy_pct = std::min(100.0, ops_per_sec / 100.0 * 100.0);
   
   return std::max(0.0, std::min(100.0, busy_pct));
+#else
+  return std::nullopt;
+#endif
 }
 
 int estimateCpuRows(const Snapshot& snapshot) {
@@ -1522,7 +1526,7 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     left_row++;
   }
 
-  /* Databases — left column */
+
   if (!snapshot.databases.empty()) {
     drawZenSectionHeader(win, left_row++, left_x, left_w, "Databases", 2);
     left_row++;
@@ -1545,7 +1549,7 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     left_row++;
   }
 
-  /* Cron jobs — left column */
+
   if (!snapshot.cron_jobs.empty()) {
     drawZenSectionHeader(win, left_row++, left_x, left_w, "Cron", 7);
     left_row++;
@@ -1562,9 +1566,8 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     left_row++;
   }
 
-  /* Right column — Ports, Services, Web, Processes */
 
-  /* Ports — scrollable */
+
   if (!snapshot.ports.empty()) {
     bool focused = (config.zen_focus == ZenFocus::kPorts);
     if (focused) {
@@ -1603,7 +1606,7 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     right_row++;
   }
 
-  /* Services — scrollable */
+
   if (!snapshot.services.empty()) {
     bool focused = (config.zen_focus == ZenFocus::kServices);
     if (focused) {
@@ -1642,7 +1645,7 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
     right_row++;
   }
 
-  /* Web servers */
+
   if (!snapshot.webservers.empty()) {
     drawZenSectionHeader(win, right_row++, right_x, right_w, "Web", 4);
     right_row++;
@@ -1794,7 +1797,7 @@ void drawHelpOverlay(WINDOW* overlay, const Config& config) {
 Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   Snapshot snapshot;
 
-  /* CPU metrics from plugin */
+
   snapshot.cpu.name = pm.get_string(HMON_METRIC_CPU_NAME, "Unknown CPU");
   auto cores = pm.get_int64(HMON_METRIC_CPU_CORES);
   if (cores) snapshot.cpu.total_cores = static_cast<int>(*cores);
@@ -1814,33 +1817,33 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
     }
   }
 
-  /* RAM metrics from plugin */
+
   auto ram_total = pm.get_int64(HMON_METRIC_RAM_TOTAL_KB);
   if (ram_total) snapshot.ram.total_kb = *ram_total;
   auto ram_avail = pm.get_int64(HMON_METRIC_RAM_AVAILABLE_KB);
   if (ram_avail) snapshot.ram.available_kb = *ram_avail;
 
-  /* Swap metrics from plugin */
+
   auto swap_total = pm.get_int64("swap.total_kb");
   if (swap_total) snapshot.swap.total_kb = *swap_total;
   auto swap_free = pm.get_int64("swap.free_kb");
   if (swap_free) snapshot.swap.free_kb = *swap_free;
 
-  /* Disk metrics from plugin */
+
   snapshot.disk.mount_point = pm.get_string(HMON_METRIC_DISK_MOUNT, "/");
   auto disk_total = pm.get_int64(HMON_METRIC_DISK_TOTAL_BYTES);
   if (disk_total) snapshot.disk.total_bytes = static_cast<unsigned long long>(*disk_total);
   auto disk_free = pm.get_int64(HMON_METRIC_DISK_FREE_BYTES);
   if (disk_free) snapshot.disk.free_bytes = static_cast<unsigned long long>(*disk_free);
 
-  /* Network metrics from plugin */
+
   snapshot.network.interface = pm.get_string(HMON_METRIC_NET_INTERFACE);
   auto rx = pm.get_double(HMON_METRIC_NET_RX_KBPS);
   if (rx) snapshot.network.rx_kbps = *rx;
   auto tx = pm.get_double(HMON_METRIC_NET_TX_KBPS);
   if (tx) snapshot.network.tx_kbps = *tx;
 
-  /* GPU metrics from plugin */
+
   if (config.show_gpu) {
     auto gpu_metrics = pm.get_by_prefix("gpu.");
     std::unordered_map<size_t, GpuMetrics> gpu_map;
@@ -1880,7 +1883,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
     }
   }
 
-  /* Docker metrics from plugin */
+
   auto docker_metrics = pm.get_by_prefix("docker.");
   std::unordered_map<size_t, DockerContainer> docker_map;
   for (const auto& m : docker_metrics) {
@@ -1926,7 +1929,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
 
   snapshot.docker_loading = snapshot.docker_containers.empty();
 
-  /* Ports */
+
   auto port_metrics = pm.get_by_prefix("ports.");
   std::unordered_map<size_t, ListeningPort> port_map;
   for (const auto& m : port_metrics) {
@@ -1946,7 +1949,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   for (size_t i = 0; i < port_map.size(); ++i)
     if (port_map.count(i)) snapshot.ports.push_back(port_map[i]);
 
-  /* Systemd services */
+
   auto svc_metrics = pm.get_by_prefix("systemd.");
   std::unordered_map<size_t, ServiceInfo> svc_map;
   for (const auto& m : svc_metrics) {
@@ -1964,7 +1967,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   for (size_t i = 0; i < svc_map.size(); ++i)
     if (svc_map.count(i)) snapshot.services.push_back(svc_map[i]);
 
-  /* Databases */
+
   auto db_metrics = pm.get_by_prefix("db.");
   std::unordered_map<size_t, DbInfo> db_map;
   for (const auto& m : db_metrics) {
@@ -1986,7 +1989,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   for (size_t i = 0; i < db_map.size(); ++i)
     if (db_map.count(i)) snapshot.databases.push_back(db_map[i]);
 
-  /* Web servers */
+
   auto ws_metrics = pm.get_by_prefix("web.");
   std::unordered_map<size_t, WebServerInfo> ws_map;
   for (const auto& m : ws_metrics) {
@@ -2006,7 +2009,7 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   for (size_t i = 0; i < ws_map.size(); ++i)
     if (ws_map.count(i)) snapshot.webservers.push_back(ws_map[i]);
 
-  /* Cron jobs */
+
   auto cron_metrics = pm.get_by_prefix("cron.");
   std::unordered_map<size_t, CronJob> cron_map;
   for (const auto& m : cron_metrics) {
@@ -2261,10 +2264,10 @@ int main(int argc, char* argv[]) {
 
   std::setlocale(LC_ALL, "");
 
-  /* Load plugins BEFORE ncurses so errors don't corrupt the display */
+
   hmon::core::PluginManager pm;
 
-  /* Load all statically linked plugins — instant, zero I/O */
+
   pm.load_static();
 
   if (pm.plugin_count() == 0) {

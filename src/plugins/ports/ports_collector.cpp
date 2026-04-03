@@ -5,9 +5,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <dirent.h>
 #include <fstream>
 #include <limits.h>
+#include <pwd.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -23,6 +25,7 @@ struct SocketEntry {
     std::string proto;
     std::string local_addr;
     uint64_t inode;
+    uint32_t uid;
 };
 
 static std::string decodeIpv4(const std::string& hex_addr) {
@@ -52,7 +55,7 @@ static uint16_t decodePort(const std::string& hex_port) {
     return static_cast<uint16_t>(port);
 }
 
-static std::vector<SocketEntry> parseProcNetTcp(const std::string& path, const std::string& proto) {
+static std::vector<SocketEntry> parseProcNetFile(const std::string& path, const std::string& proto) {
     std::vector<SocketEntry> result;
     std::ifstream f(path);
     if (!f) return result;
@@ -60,9 +63,9 @@ static std::vector<SocketEntry> parseProcNetTcp(const std::string& path, const s
     std::getline(f, line);
     while (std::getline(f, line)) {
         std::istringstream iss(line);
-        std::string sl, local, remote, st, txq, rxq, tr, t, uid, timeout;
+        std::string sl, local, remote, st, txrx, trtm, retrnsmt, uid_str, timeout;
         std::string inode_str;
-        iss >> sl >> local >> remote >> st >> txq >> rxq >> tr >> t >> uid >> timeout >> inode_str;
+        iss >> sl >> local >> remote >> st >> txrx >> trtm >> retrnsmt >> uid_str >> timeout >> inode_str;
         if (proto == "tcp" && st != "0A") continue;
         if (proto == "tcp6" && st != "0A") continue;
         if (proto == "udp" && st != "07") continue;
@@ -77,20 +80,22 @@ static std::vector<SocketEntry> parseProcNetTcp(const std::string& path, const s
         se.proto = proto;
         if (addr_hex.size() == 8) {
             se.local_addr = decodeIpv4(addr_hex);
-            se.proto = (proto == "tcp6") ? "tcp" : "udp";
+            se.proto = (proto == "tcp6" || proto == "tcp") ? "tcp" : "udp";
         } else {
             se.local_addr = decodeIpv6(addr_hex);
         }
         try { se.inode = std::stoull(inode_str); } catch (...) { se.inode = 0; }
+        try { se.uid = static_cast<uint32_t>(std::stoul(uid_str)); } catch (...) { se.uid = 0; }
         if (!se.local_addr.empty()) result.push_back(std::move(se));
     }
     return result;
 }
 
-static std::string getProcessNameForInode(uint64_t target_inode) {
-    if (target_inode == 0) return "";
+static std::unordered_map<uint64_t, std::string> buildInodeMap() {
+    std::unordered_map<uint64_t, std::string> result;
     DIR* proc = opendir("/proc");
-    if (!proc) return "";
+    if (!proc) return result;
+
     struct dirent* entry;
     while ((entry = readdir(proc)) != nullptr) {
         if (entry->d_type != DT_DIR) continue;
@@ -106,55 +111,44 @@ static std::string getProcessNameForInode(uint64_t target_inode) {
         DIR* fd_dir = opendir(fd_path);
         if (!fd_dir) continue;
 
+        std::string process_name;
         struct dirent* fd_entry;
-        bool found = false;
         while ((fd_entry = readdir(fd_dir)) != nullptr) {
             if (fd_entry->d_type != DT_LNK) continue;
             char link_path[PATH_MAX];
             std::snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%s", pid, fd_entry->d_name);
             char target[PATH_MAX];
             ssize_t len = readlink(link_path, target, sizeof(target) - 1);
-            if (len > 0) {
-                target[len] = '\0';
-                std::string link_target(target);
-                if (link_target.rfind("socket:[", 0) == 0 && link_target.back() == ']') {
-                    size_t start = 8;
-                    size_t end = link_target.size() - 1;
-                    try {
-                        uint64_t sock_inode = std::stoull(link_target.substr(start, end - start));
-                        if (sock_inode == target_inode) {
-                            char comm_path[256];
-                            std::snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
-                            std::ifstream comm(comm_path);
-                            if (comm) {
-                                std::string name;
-                                std::getline(comm, name);
-                                if (!name.empty()) {
-                                    found = true;
-                                    closedir(fd_dir);
-                                    break;
-                                }
-                            }
-                        }
-                    } catch (...) {}
-                }
+            if (len <= 0) continue;
+            target[len] = '\0';
+            if (std::strncmp(target, "socket:[", 8) != 0) continue;
+            char* end_bracket = std::strchr(target + 8, ']');
+            if (!end_bracket) continue;
+            *end_bracket = '\0';
+            uint64_t inode = 0;
+            try { inode = std::stoull(target + 8); } catch (...) { continue; }
+            if (inode == 0 || result.count(inode)) continue;
+
+            if (process_name.empty()) {
+                char comm_path[256];
+                std::snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+                std::ifstream comm(comm_path);
+                if (comm) std::getline(comm, process_name);
+            }
+            if (!process_name.empty()) {
+                result[inode] = process_name;
             }
         }
         closedir(fd_dir);
-        if (found) {
-            closedir(proc);
-            char comm_path[256];
-            std::snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
-            std::ifstream comm(comm_path);
-            if (comm) {
-                std::string name;
-                std::getline(comm, name);
-                if (!name.empty()) return name;
-            }
-        }
     }
     closedir(proc);
-    return "";
+    return result;
+}
+
+static std::string uidToName(uint32_t uid) {
+    struct passwd* pw = getpwuid(uid);
+    if (pw && pw->pw_name) return pw->pw_name;
+    return std::to_string(uid);
 }
 
 }
@@ -171,7 +165,6 @@ std::vector<ListeningPort> collectListeningPorts(PortsPluginCtx* ctx) {
     }
 
     std::vector<ListeningPort> result;
-    std::unordered_map<uint64_t, std::string> inode_to_process;
 
     std::vector<std::pair<std::string, std::string>> files = {
         {"/proc/net/tcp", "tcp"},
@@ -182,13 +175,16 @@ std::vector<ListeningPort> collectListeningPorts(PortsPluginCtx* ctx) {
 
     std::vector<SocketEntry> all_sockets;
     for (const auto& [path, proto] : files) {
-        auto entries = parseProcNetTcp(path, proto);
+        auto entries = parseProcNetFile(path, proto);
         all_sockets.insert(all_sockets.end(), entries.begin(), entries.end());
     }
 
+    auto inode_map = buildInodeMap();
+
     std::unordered_set<std::string> seen;
     for (auto& se : all_sockets) {
-        std::string key = se.local_addr + ":" + std::to_string(se.port) + ":" + se.proto;
+        std::string proto_base = (se.proto == "tcp" || se.proto == "tcp6") ? "tcp" : "udp";
+        std::string key = std::to_string(se.port) + ":" + proto_base;
         if (seen.count(key)) continue;
         seen.insert(key);
 
@@ -198,18 +194,57 @@ std::vector<ListeningPort> collectListeningPorts(PortsPluginCtx* ctx) {
         lp.local_addr = se.local_addr;
 
         if (se.inode > 0) {
-            auto it = inode_to_process.find(se.inode);
-            if (it != inode_to_process.end()) {
+            auto it = inode_map.find(se.inode);
+            if (it != inode_map.end()) {
                 lp.process = it->second;
-            } else {
-                lp.process = getProcessNameForInode(se.inode);
-                if (!lp.process.empty()) {
-                    inode_to_process[se.inode] = lp.process;
-                }
             }
         }
 
+        if (lp.process.empty() && se.uid > 0) {
+            lp.process = uidToName(se.uid);
+        } else if (lp.process.empty() && se.uid == 0) {
+            lp.process = "root";
+        }
+
         result.push_back(std::move(lp));
+    }
+
+    // Attempt to resolve 'root' ports to docker containers
+    std::unordered_map<uint16_t, std::string> docker_ports;
+    FILE* pipe = popen("docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null", "r");
+    if (pipe) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), pipe)) {
+            std::string line(buf);
+            size_t bar = line.find('|');
+            if (bar != std::string::npos) {
+                std::string name = line.substr(0, bar);
+                std::string ports = line.substr(bar + 1);
+                std::istringstream iss(ports);
+                std::string token;
+                while (std::getline(iss, token, ',')) {
+                    size_t arrow = token.find("->");
+                    if (arrow != std::string::npos) {
+                        size_t colon = token.rfind(':', arrow);
+                        if (colon != std::string::npos) {
+                            try {
+                                uint16_t dport = static_cast<uint16_t>(std::stoi(token.substr(colon + 1, arrow - colon - 1)));
+                                docker_ports[dport] = name;
+                            } catch (...) {}
+                        }
+                    }
+                }
+            }
+        }
+        pclose(pipe);
+    }
+
+    for (auto& lp : result) {
+        if (lp.process == "root" || lp.process.empty()) {
+            if (docker_ports.count(lp.port)) {
+                lp.process = docker_ports[lp.port];
+            }
+        }
     }
 
     std::sort(result.begin(), result.end(),

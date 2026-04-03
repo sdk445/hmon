@@ -118,18 +118,24 @@ static std::vector<ProcInfo> readAllProcesses() {
         uint64_t utime = 0, stime = 0;
         long cutime, cstime, priority, nice, num_threads, itrealvalue;
         unsigned long long starttime;
+        unsigned long long vsize = 0;
         long rss = 0;
         iss >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid
             >> flags >> minflt >> cminflt >> majflt >> cmajflt
             >> utime >> stime >> cutime >> cstime >> priority >> nice
-            >> num_threads >> itrealvalue >> starttime >> rss;
+            >> num_threads >> itrealvalue >> starttime >> vsize >> rss;
+
+        if (rss <= 0) continue;
+
+        std::string cmd = readCmdline(pid);
+        if (cmd.empty() || cmd[0] == '[') continue;
 
         ProcInfo pi;
         pi.pid = pid;
         pi.utime = utime;
         pi.stime = stime;
         pi.rss_pages = static_cast<uint64_t>(rss);
-        pi.command = readCmdline(pid);
+        pi.command = std::move(cmd);
         result.push_back(std::move(pi));
     }
     closedir(dir);

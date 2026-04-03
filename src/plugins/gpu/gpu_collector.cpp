@@ -193,12 +193,12 @@ std::optional<double> readHwmonPower(const fs::path& sensor) {
 std::optional<double> readSensorsPower() {
     std::string output = runCommand("sensors -j 2>/dev/null");
     if (output.empty()) return std::nullopt;
-    /* Simple grep for power lines in sensors output */
+
     std::istringstream stream(output);
     std::string line;
     while (std::getline(stream, line)) {
         if (line.find("power") != std::string::npos && line.find("W") != std::string::npos) {
-            /* Try to extract a numeric value */
+
             for (size_t i = 0; i < line.size(); i++) {
                 if (std::isdigit(line[i]) || line[i] == '.') {
                     try {
