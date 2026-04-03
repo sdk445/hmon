@@ -2,6 +2,6 @@
 
 namespace version {
 
-inline constexpr char kCurrent[] = "0.3.0";
+inline constexpr char kCurrent[] = "1.0.0";
 
 }
