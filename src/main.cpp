@@ -42,18 +42,72 @@
 #include <sys/socket.h>
 #endif
 
+#include "hmon/plugin_abi.h"
+#include "hmon/plugin_manager.hpp"
 #include "metrics/types.hpp"
 #include "metrics/version.hpp"
 
-#ifdef __APPLE__
-#include "metrics/cpu_darwin.hpp"
-#include "metrics/gpu_darwin.hpp"
-#include "metrics/system_darwin.hpp"
-#else
-#include "metrics/cpu.hpp"
-#include "metrics/gpu.hpp"
-#include "metrics/system.hpp"
+#ifndef HMON_PLUGIN_DIR
+#define HMON_PLUGIN_DIR "/usr/local/lib/hmon/plugins"
 #endif
+
+std::string currentTimestamp();
+std::string hostName();
+std::string humanBytes(unsigned long long bytes);
+std::optional<double> getSwapUsagePercent();
+
+std::string currentTimestamp() {
+  auto now = std::chrono::system_clock::now();
+  auto t = std::chrono::system_clock::to_time_t(now);
+  struct tm tm_buf;
+  localtime_r(&t, &tm_buf);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm_buf);
+  return buf;
+}
+
+std::string hostName() {
+  char buf[256];
+  if (gethostname(buf, sizeof(buf)) == 0) return buf;
+  return "unknown";
+}
+
+std::string humanBytes(unsigned long long bytes) {
+  const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  int level = 0;
+  double value = static_cast<double>(bytes);
+  while (value >= 1024.0 && level < 4) {
+    value /= 1024.0;
+    ++level;
+  }
+  char buf[64];
+  if (level == 0) {
+    std::snprintf(buf, sizeof(buf), "%llu %s", bytes, units[level]);
+  } else {
+    std::snprintf(buf, sizeof(buf), "%.2f %s", value, units[level]);
+  }
+  return buf;
+}
+
+std::optional<double> getSwapUsagePercent() {
+  std::ifstream f("/proc/meminfo");
+  if (!f) return std::nullopt;
+  std::string line;
+  long long total = 0, free = 0;
+  bool has_total = false;
+  while (std::getline(f, line)) {
+    if (line.rfind("SwapTotal:", 0) == 0) {
+      std::istringstream iss(line.substr(10));
+      if (iss >> total) has_total = true;
+    } else if (line.rfind("SwapFree:", 0) == 0) {
+      std::istringstream iss(line.substr(9));
+      if (iss >> free) {}
+    }
+  }
+  if (!has_total || total <= 0) return std::nullopt;
+  long long used = total - free;
+  return 100.0 * static_cast<double>(used) / static_cast<double>(total);
+}
 
 enum class SortMode { kCpu, kMem, kGpu, kPid };
 
@@ -249,13 +303,13 @@ std::string formatCpuFrequency(const std::optional<double>& mhz) {
   return out.str();
 }
 
-std::string formatCpuTopology(const CpuMetrics& cpu) {
-  if (!cpu.total_cores && !cpu.total_threads) {
+std::string formatCpuTopology(const std::optional<int>& cores, const std::optional<int>& threads) {
+  if (!cores && !threads) {
     return "N/A";
   }
-  const std::string cores = cpu.total_cores ? std::to_string(*cpu.total_cores) : "N/A";
-  const std::string threads = cpu.total_threads ? std::to_string(*cpu.total_threads) : "N/A";
-  return cores + "C / " + threads + "T";
+  const std::string cores_str = cores ? std::to_string(*cores) : "N/A";
+  const std::string threads_str = threads ? std::to_string(*threads) : "N/A";
+  return cores_str + "C / " + threads_str + "T";
 }
 
 std::string formatMibOrGib(const std::optional<double>& mib_value) {
@@ -271,11 +325,11 @@ std::string formatMibOrGib(const std::optional<double>& mib_value) {
   return out.str();
 }
 
-std::string formatGpuVramUsage(const GpuMetrics& gpu) {
-  if (!gpu.memory_used_mib || !gpu.memory_total_mib) {
+std::string formatGpuVramUsage(const std::optional<double>& used, const std::optional<double>& total) {
+  if (!used || !total) {
     return "N/A";
   }
-  return formatMibOrGib(gpu.memory_used_mib) + " / " + formatMibOrGib(gpu.memory_total_mib);
+  return formatMibOrGib(used) + " / " + formatMibOrGib(total);
 }
 
 bool processListContainsPid(const std::vector<ProcessInfo>& processes, int pid) {
@@ -642,227 +696,18 @@ void drawBrailleLayer(WINDOW* win, const BrailleCanvas& canvas, int top, int lef
   }
 }
 
-#ifdef __APPLE__
-std::vector<ProcessInfo> collectTopProcesses(size_t limit, SortMode sort_mode, int lock_pid) {
-  std::vector<ProcessInfo> processes;
-  if (limit == 0) return processes;
-
-  std::string sort_key = "cpu";
-  switch (sort_mode) {
-    case SortMode::kMem: sort_key = "rsize"; break;
-    case SortMode::kPid: sort_key = "pid"; break;
-    default: sort_key = "cpu"; break;
-  }
-
-  std::string cmd = "ps -eo pid,%cpu,%mem,comm --sort=-" + sort_key + " -c 2>/dev/null | head -" + std::to_string(limit + 1);
-  if (lock_pid > 0) {
-    cmd = "ps -o pid,%cpu,%mem,comm -p " + std::to_string(lock_pid) + " -c 2>/dev/null";
-  }
-
-  FILE* pipe = popen(cmd.c_str(), "r");
-  if (!pipe) return processes;
-
-  char buffer[512];
-  bool first = true;
-  while (fgets(buffer, sizeof(buffer), pipe)) {
-    if (first) { first = false; continue; }
-    
-    ProcessInfo proc;
-    std::istringstream iss(buffer);
-    if (iss >> proc.pid >> proc.cpu_percent >> proc.mem_percent) {
-      std::getline(iss >> std::ws, proc.command);
-      if (!proc.command.empty()) {
-        processes.push_back(proc);
-      }
-    }
-  }
-  pclose(pipe);
-  return processes;
-}
-#else
-std::string trimProcessCommand(const std::string& command, size_t max_width = 50) {
-  if (command.size() <= max_width) {
-    return command;
-  }
-  if (max_width <= 3) {
-    return command.substr(0, max_width);
-  }
-  return command.substr(0, max_width - 3) + "...";
-}
-
-std::unordered_map<int, double> collectGpuProcessUsage() {
-  std::unordered_map<int, double> usage_by_pid;
-
-  FILE* gpu_pipe = popen("nvidia-smi pmon -c 1 2>/dev/null | tail -n +3 | awk '{print $2, $4}'", "r");
-  if (!gpu_pipe) {
-    return usage_by_pid;
-  }
-
-  char gpu_buffer[256];
-  while (fgets(gpu_buffer, sizeof(gpu_buffer), gpu_pipe)) {
-    int pid = 0;
-    std::string sm_util;
-    std::istringstream stream(gpu_buffer);
-    if (!(stream >> pid >> sm_util) || pid <= 0 || sm_util == "-") {
-      continue;
-    }
-    try {
-      usage_by_pid[pid] = std::stod(sm_util);
-    } catch (...) {
-    }
-  }
-
-  pclose(gpu_pipe);
-  return usage_by_pid;
-}
-
-std::vector<ProcessInfo> collectProcessesFromPsCommand(const std::string& command) {
-  std::vector<ProcessInfo> processes;
-
-  FILE* pipe = popen(command.c_str(), "r");
-  if (!pipe) {
-    return processes;
-  }
-
-  char buffer[512];
-  while (fgets(buffer, sizeof(buffer), pipe)) {
-    ProcessInfo proc;
-    std::istringstream iss(buffer);
-    if (!(iss >> proc.pid >> proc.cpu_percent >> proc.mem_percent)) {
-      continue;
-    }
-    std::getline(iss >> std::ws, proc.command);
-    proc.command = trimProcessCommand(proc.command);
-    processes.push_back(proc);
-  }
-
-  pclose(pipe);
-  return processes;
-}
-
-void attachGpuPercents(std::vector<ProcessInfo>* processes,
-                       const std::unordered_map<int, double>& usage_by_pid) {
-  if (!processes) {
-    return;
-  }
-  for (auto& process : *processes) {
-    if (const auto it = usage_by_pid.find(process.pid); it != usage_by_pid.end()) {
-      process.gpu_percent = it->second;
-    }
-  }
-}
-
-std::vector<ProcessInfo> collectTopProcesses(size_t limit, SortMode sort_mode, int lock_pid) {
-  std::vector<ProcessInfo> processes;
-  if (limit == 0) return processes;
-
-  const auto gpu_usage_by_pid = collectGpuProcessUsage();
-  if (lock_pid > 0) {
-    processes = collectProcessesFromPsCommand(
-        "ps -o pid,%cpu,%mem,args -p " + std::to_string(lock_pid) + " --no-headers 2>/dev/null");
-    attachGpuPercents(&processes, gpu_usage_by_pid);
-    return processes;
-  }
-
-  if (sort_mode == SortMode::kGpu && !gpu_usage_by_pid.empty()) {
-    std::string pid_list;
-    for (const auto& [pid, _] : gpu_usage_by_pid) {
-      if (!pid_list.empty()) {
-        pid_list += ",";
-      }
-      pid_list += std::to_string(pid);
-    }
-
-    processes = collectProcessesFromPsCommand(
-        "ps -p " + pid_list + " -o pid,%cpu,%mem,args --no-headers 2>/dev/null");
-    attachGpuPercents(&processes, gpu_usage_by_pid);
-    std::stable_sort(processes.begin(), processes.end(), [](const ProcessInfo& lhs, const ProcessInfo& rhs) {
-      if (lhs.gpu_percent != rhs.gpu_percent) {
-        return lhs.gpu_percent > rhs.gpu_percent;
-      }
-      if (lhs.cpu_percent != rhs.cpu_percent) {
-        return lhs.cpu_percent > rhs.cpu_percent;
-      }
-      return lhs.pid < rhs.pid;
-    });
-    if (processes.size() > limit) {
-      processes.resize(limit);
-    }
-    return processes;
-  }
-
-  std::string sort_key = "%cpu";
-  switch (sort_mode) {
-    case SortMode::kMem: sort_key = "%mem"; break;
-    case SortMode::kPid: sort_key = "pid"; break;
-    default: sort_key = "%cpu"; break;
-  }
-
-  processes = collectProcessesFromPsCommand(
-      "ps -eo pid,%cpu,%mem,args --sort=-" + sort_key + " --no-headers 2>/dev/null | head -" +
-      std::to_string(limit));
-  attachGpuPercents(&processes, gpu_usage_by_pid);
-  return processes;
-}
-#endif
-
-void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max_points,
-                   const std::optional<double>& disk_busy_percent) {
-  if (!history || max_points == 0) return;
-
-  auto appendValue = [&](std::vector<double>& series, const std::optional<double>& value) {
-    const double next_value = std::max(0.0, std::min(100.0, value.value_or(series.empty() ? 0.0 : series.back())));
-    series.push_back(next_value);
-    if (series.size() > max_points) {
-      series.erase(series.begin(), series.begin() + static_cast<std::ptrdiff_t>(series.size() - max_points));
-    }
-  };
-
-  appendValue(history->cpu_usage, snapshot.cpu.usage_percent);
-  appendValue(history->cpu_temp, snapshot.cpu.temperature_c);
-  
-  if (snapshot.ram.total_kb && snapshot.ram.available_kb && *snapshot.ram.total_kb > 0) {
-    const double ram_pct = 100.0 * (static_cast<double>(*snapshot.ram.total_kb) - 
-                                    static_cast<double>(*snapshot.ram.available_kb)) / 
-                           static_cast<double>(*snapshot.ram.total_kb);
-    appendValue(history->ram_usage, ram_pct);
-  } else {
-    appendValue(history->ram_usage, std::nullopt);
-  }
-
-  if (!snapshot.gpus.empty()) {
-    const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
-    appendValue(history->gpu_usage, gpu.utilization_percent);
-    if (gpu.memory_utilization_percent) {
-      appendValue(history->gpu_vram_usage, gpu.memory_utilization_percent);
-    } else if (gpu.memory_used_mib && gpu.memory_total_mib && *gpu.memory_total_mib > 0) {
-      appendValue(history->gpu_vram_usage, 100.0 * (*gpu.memory_used_mib) / (*gpu.memory_total_mib));
-    } else {
-      appendValue(history->gpu_vram_usage, std::nullopt);
-    }
-  } else {
-    appendValue(history->gpu_usage, std::nullopt);
-    appendValue(history->gpu_vram_usage, std::nullopt);
-  }
-
-  if (disk_busy_percent) {
-    appendValue(history->disk_usage, disk_busy_percent);
-  } else if (snapshot.disk.total_bytes && snapshot.disk.free_bytes && *snapshot.disk.total_bytes > 0) {
-    const double disk_pct = 100.0 * static_cast<double>(*snapshot.disk.total_bytes - *snapshot.disk.free_bytes) /
-                            static_cast<double>(*snapshot.disk.total_bytes);
-    appendValue(history->disk_usage, disk_pct);
-  } else {
-    appendValue(history->disk_usage, std::nullopt);
-  }
-}
-
-#ifdef __APPLE__
 std::optional<double> computeRootDiskBusyPercent() {
   static std::optional<unsigned long long> previous_read_ops;
   static std::optional<unsigned long long> previous_write_ops;
   static std::chrono::steady_clock::time_point previous_time;
 
-  const std::string output = darwin_utils::runCommand("iostat -d disk0 1 1 2>/dev/null | tail -1");
+  std::string output;
+  FILE* pipe = popen("iostat -d disk0 1 1 2>/dev/null | tail -1", "r");
+  if (pipe) {
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe)) output += buf;
+    pclose(pipe);
+  }
   if (output.empty()) {
     return std::nullopt;
   }
@@ -908,183 +753,6 @@ std::optional<double> computeRootDiskBusyPercent() {
   
   return std::max(0.0, std::min(100.0, busy_pct));
 }
-#else
-struct DiskStats {
-  unsigned long long sectors_read = 0;
-  unsigned long long sectors_written = 0;
-  unsigned long long io_time = 0;
-};
-
-std::optional<std::pair<double, double>> computeRootDiskSpeed() {
-  static std::string root_device;
-  static std::optional<DiskStats> previous_stats;
-  static std::chrono::steady_clock::time_point previous_time;
-
-  if (root_device.empty()) {
-    std::ifstream mounts("/proc/self/mounts");
-    std::string line;
-    while (std::getline(mounts, line)) {
-      std::istringstream iss(line);
-      std::string device, mountpoint, fstype;
-      if (iss >> device >> mountpoint >> fstype && mountpoint == "/") {
-        std::string dev = device;
-        size_t last_slash = dev.rfind('/');
-        if (last_slash != std::string::npos) {
-          dev = dev.substr(last_slash + 1);
-        }
-        if (dev.find("nvme") != std::string::npos) {
-          size_t pns = dev.find("p");
-          if (pns != std::string::npos) {
-            dev = dev.substr(0, pns);
-          }
-        } else if (dev.find_first_of("0123456789") != std::string::npos) {
-          size_t end = dev.find_first_of("0123456789");
-          while (end < dev.size() && std::isdigit(dev[end])) end++;
-          dev = dev.substr(0, end);
-        }
-        root_device = dev;
-        break;
-      }
-    }
-    if (root_device.empty()) root_device = "sda";
-  }
-
-  std::ifstream diskstats("/proc/diskstats");
-  if (!diskstats) return std::nullopt;
-
-  DiskStats current_stats;
-  bool found = false;
-  std::string line;
-  while (std::getline(diskstats, line)) {
-    std::istringstream line_stream(line);
-    unsigned int major_num = 0, minor_num = 0;
-    std::string device_name;
-    if (!(line_stream >> major_num >> minor_num >> device_name)) continue;
-    if (device_name != root_device) continue;
-    
-    found = true;
-    unsigned long long value = 0;
-    for (int i = 0; i < 14 && line_stream >> value; i++) {
-      if (i == 2) current_stats.sectors_read = value;
-      else if (i == 6) current_stats.sectors_written = value;
-      else if (i == 7 || i == 11) current_stats.io_time += value;
-    }
-    break;
-  }
-
-  if (!found) return std::make_pair(0.0, 0.0);
-
-  const auto now = std::chrono::steady_clock::now();
-  
-  if (!previous_stats.has_value()) {
-    previous_stats = current_stats;
-    previous_time = now;
-    return std::make_pair(0.0, 0.0);
-  }
-
-  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time).count();
-  if (elapsed_ms <= 0) {
-    previous_stats = current_stats;
-    previous_time = now;
-    return std::make_pair(0.0, 0.0);
-  }
-
-  const long long sectors_read_delta = static_cast<long long>(current_stats.sectors_read) - static_cast<long long>(previous_stats->sectors_read);
-  const long long sectors_written_delta = static_cast<long long>(current_stats.sectors_written) - static_cast<long long>(previous_stats->sectors_written);
-  
-  previous_stats = current_stats;
-  previous_time = now;
-
-  const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
-  const double read_kbs = (static_cast<double>(sectors_read_delta) * 0.5) / elapsed_sec;
-  const double write_kbs = (static_cast<double>(sectors_written_delta) * 0.5) / elapsed_sec;
-
-  return std::make_pair(std::max(0.0, read_kbs), std::max(0.0, write_kbs));
-}
-
-std::optional<double> computeRootDiskBusyPercent() {
-  static std::optional<DiskStats> previous_stats;
-  static std::chrono::steady_clock::time_point previous_time;
-
-  auto speed = computeRootDiskSpeed();
-  if (!speed) return std::nullopt;
-
-  DiskStats current_stats;
-  std::ifstream diskstats("/proc/diskstats");
-  if (!diskstats) return std::nullopt;
-
-  static std::string root_device;
-  if (root_device.empty()) {
-    FILE* fp = fopen("/proc/self/mounts", "r");
-    if (fp) {
-      char device[256], mountpoint[256], fstype[64];
-      while (fscanf(fp, "%255s %255s %63s", device, mountpoint, fstype) == 3) {
-        if (strcmp(mountpoint, "/") == 0) {
-          std::string dev(device);
-          size_t last_slash = dev.rfind('/');
-          if (last_slash != std::string::npos) {
-            root_device = dev.substr(last_slash + 1);
-          }
-          if (root_device.find("nvme") != std::string::npos) {
-            size_t pns = root_device.find("p");
-            if (pns != std::string::npos) {
-              root_device = root_device.substr(0, pns);
-            }
-          } else if (root_device.find_first_of("0123456789") != std::string::npos) {
-            size_t digit_pos = root_device.find_first_of("0123456789");
-            size_t end = digit_pos;
-            while (end < root_device.size() && std::isdigit(root_device[end])) {
-              end++;
-            }
-            root_device = root_device.substr(0, end);
-          }
-          break;
-        }
-      }
-      fclose(fp);
-    }
-    if (root_device.empty()) root_device = "sda";
-  }
-
-  std::string line;
-  while (std::getline(diskstats, line)) {
-    std::istringstream line_stream(line);
-    unsigned int major_num = 0, minor_num = 0;
-    std::string device_name;
-    if (!(line_stream >> major_num >> minor_num >> device_name)) continue;
-    if (device_name != root_device) continue;
-
-    std::vector<unsigned long long> fields;
-    unsigned long long value = 0;
-    while (line_stream >> value) {
-      fields.push_back(value);
-    }
-    
-    if (fields.size() >= 14) {
-      current_stats.io_time = fields[7] + fields[11];
-      break;
-    }
-  }
-
-  const auto now = std::chrono::steady_clock::now();
-  if (!previous_stats) {
-    previous_stats = current_stats;
-    previous_time = now;
-    return 0.0;
-  }
-
-  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time).count();
-  const long long io_time_delta = static_cast<long long>(current_stats.io_time) - static_cast<long long>(previous_stats->io_time);
-  
-  previous_stats = current_stats;
-  previous_time = now;
-
-  if (elapsed_ms <= 0 || io_time_delta < 0) return 0.0;
-  
-  const double busy = 100.0 * static_cast<double>(io_time_delta) / static_cast<double>(elapsed_ms);
-  return std::max(0.0, std::min(100.0, busy));
-}
-#endif
 
 int estimateCpuRows(const Snapshot& snapshot) {
   int rows = 5;
@@ -1137,7 +805,7 @@ void renderCpuPanel(WINDOW* panel, const Snapshot& snapshot) {
   }
   wattroff(panel, A_BOLD);
   
-  addWindowLine(panel, row++, "Topology: " + formatCpuTopology(snapshot.cpu));
+  addWindowLine(panel, row++, "Topology: " + formatCpuTopology(snapshot.cpu.total_cores, snapshot.cpu.total_threads));
   addWindowLine(panel, row++, "Speed: " + formatCpuFrequency(snapshot.cpu.frequency_mhz));
 
   if (snapshot.cpu.usage_percent && row < max_y - 1) {
@@ -1257,7 +925,7 @@ void renderGpuPanel(WINDOW* panel, const Snapshot& snapshot) {
     addWindowLine(panel, row++, "Temperature: " + formatOptional(gpu.temperature_c, " C", 1));
     addWindowLine(panel, row++, "Speed: " + formatOptional(gpu.core_clock_mhz, " MHz", 0));
     addWindowLine(panel, row++, "Power: " + formatOptional(gpu.power_w, " W", 1));
-    addWindowLine(panel, row++, "VRAM: " + formatGpuVramUsage(gpu));
+    addWindowLine(panel, row++, "VRAM: " + formatGpuVramUsage(gpu.memory_used_mib, gpu.memory_total_mib));
 
     if (!gpu.memory_used_mib && row < max_y - 1) {
       addWindowLine(panel, row++, "VRAM source not exposed");
@@ -1680,7 +1348,7 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
       }
       if (gpu.memory_utilization_percent) {
         drawSummaryBar(left_row++, left_x + 1, left_w - 2, "VRAM", *gpu.memory_utilization_percent,
-                       formatGpuVramUsage(gpu));
+                       formatGpuVramUsage(gpu.memory_used_mib, gpu.memory_total_mib));
       }
 
       std::vector<std::string> details;
@@ -1868,16 +1536,171 @@ void drawHelpOverlay(WINDOW* overlay, const Config& config) {
   wnoutrefresh(overlay);
 }
 
-Snapshot collectSnapshot(const Config& config) {
+Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   Snapshot snapshot;
-  snapshot.cpu = collectCpuMetrics();
-  snapshot.ram = collectRam();
-  snapshot.disk = collectDisk("/");
-  snapshot.network = collectNetwork();
-  if (config.show_gpu) {
-    snapshot.gpus = collectGpus();
+
+  /* CPU metrics from plugin */
+  snapshot.cpu.name = pm.get_string(HMON_METRIC_CPU_NAME, "Unknown CPU");
+  auto cores = pm.get_int64(HMON_METRIC_CPU_CORES);
+  if (cores) snapshot.cpu.total_cores = static_cast<int>(*cores);
+  auto threads = pm.get_int64(HMON_METRIC_CPU_THREADS);
+  if (threads) snapshot.cpu.total_threads = static_cast<int>(*threads);
+  auto temp = pm.get_double(HMON_METRIC_CPU_TEMP_C);
+  if (temp) snapshot.cpu.temperature_c = *temp;
+  auto freq = pm.get_double(HMON_METRIC_CPU_FREQ_MHZ);
+  if (freq) snapshot.cpu.frequency_mhz = *freq;
+  auto usage = pm.get_double(HMON_METRIC_CPU_USAGE_PCT);
+  if (usage) snapshot.cpu.usage_percent = *usage;
+
+  auto core_metrics = pm.get_by_prefix("cpu.core_usage_pct.");
+  for (const auto& m : core_metrics) {
+    if (m.value.type == HMON_VAL_DOUBLE) {
+      snapshot.cpu.core_usage_percent.push_back(m.value.v.f64);
+    }
   }
+
+  /* RAM metrics from plugin */
+  auto ram_total = pm.get_int64(HMON_METRIC_RAM_TOTAL_KB);
+  if (ram_total) snapshot.ram.total_kb = *ram_total;
+  auto ram_avail = pm.get_int64(HMON_METRIC_RAM_AVAILABLE_KB);
+  if (ram_avail) snapshot.ram.available_kb = *ram_avail;
+
+  /* Disk metrics from plugin */
+  snapshot.disk.mount_point = pm.get_string(HMON_METRIC_DISK_MOUNT, "/");
+  auto disk_total = pm.get_int64(HMON_METRIC_DISK_TOTAL_BYTES);
+  if (disk_total) snapshot.disk.total_bytes = static_cast<unsigned long long>(*disk_total);
+  auto disk_free = pm.get_int64(HMON_METRIC_DISK_FREE_BYTES);
+  if (disk_free) snapshot.disk.free_bytes = static_cast<unsigned long long>(*disk_free);
+
+  /* Network metrics from plugin */
+  snapshot.network.interface = pm.get_string(HMON_METRIC_NET_INTERFACE);
+  auto rx = pm.get_double(HMON_METRIC_NET_RX_KBPS);
+  if (rx) snapshot.network.rx_kbps = *rx;
+  auto tx = pm.get_double(HMON_METRIC_NET_TX_KBPS);
+  if (tx) snapshot.network.tx_kbps = *tx;
+
+  /* GPU metrics from plugin */
+  if (config.show_gpu) {
+    auto gpu_metrics = pm.get_by_prefix("gpu.");
+    std::unordered_map<size_t, GpuMetrics> gpu_map;
+    for (const auto& m : gpu_metrics) {
+      size_t idx = 0;
+      if (std::sscanf(m.key.c_str(), "gpu.%zu.", &idx) != 1) continue;
+
+      if (m.key.find(".name") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+        gpu_map[idx].name = m.value.v.str;
+      } else if (m.key.find(".source") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+        gpu_map[idx].source = m.value.v.str;
+      } else if (m.key.find(".temp_c") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].temperature_c = m.value.v.f64;
+      } else if (m.key.find(".clock_mhz") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].core_clock_mhz = m.value.v.f64;
+      } else if (m.key.find(".usage_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].utilization_percent = m.value.v.f64;
+      } else if (m.key.find(".power_w") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].power_w = m.value.v.f64;
+      } else if (m.key.find(".vram_used_mib") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].memory_used_mib = m.value.v.f64;
+      } else if (m.key.find(".vram_total_mib") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].memory_total_mib = m.value.v.f64;
+      } else if (m.key.find(".vram_usage_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].memory_utilization_percent = m.value.v.f64;
+      } else if (m.key.find(".in_use") != std::string::npos && m.value.type == HMON_VAL_BOOL) {
+        gpu_map[idx].in_use = m.value.v.b != 0;
+      } else if (m.key.find(".core_usage.") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+        gpu_map[idx].gpu_core_usage_percent.push_back(m.value.v.f64);
+      }
+    }
+
+    for (size_t i = 0; i < gpu_map.size(); ++i) {
+      if (gpu_map.count(i)) {
+        snapshot.gpus.push_back(gpu_map[i]);
+      }
+    }
+  }
+
   return snapshot;
+}
+
+std::vector<ProcessInfo> collectProcesses(hmon::core::PluginManager& pm, size_t limit, SortMode /*sort_mode*/, int /*lock_pid*/) {
+  std::vector<ProcessInfo> processes;
+
+  auto proc_metrics = pm.get_by_prefix("proc.");
+  std::unordered_map<size_t, ProcessInfo> proc_map;
+  for (const auto& m : proc_metrics) {
+    size_t idx = 0;
+    if (std::sscanf(m.key.c_str(), "proc.%zu.", &idx) != 1) continue;
+
+    if (m.key.find(".pid") != std::string::npos && m.value.type == HMON_VAL_INT64) {
+      proc_map[idx].pid = static_cast<int>(m.value.v.i64);
+    } else if (m.key.find(".cpu_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      proc_map[idx].cpu_percent = m.value.v.f64;
+    } else if (m.key.find(".mem_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      proc_map[idx].mem_percent = m.value.v.f64;
+    } else if (m.key.find(".gpu_pct") != std::string::npos && m.value.type == HMON_VAL_DOUBLE) {
+      proc_map[idx].gpu_percent = m.value.v.f64;
+    } else if (m.key.find(".command") != std::string::npos && m.value.type == HMON_VAL_STRING) {
+      proc_map[idx].command = m.value.v.str;
+    }
+  }
+
+  for (size_t i = 0; i < proc_map.size() && processes.size() < limit; ++i) {
+    if (proc_map.count(i)) {
+      processes.push_back(proc_map[i]);
+    }
+  }
+
+  return processes;
+}
+
+void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max_points,
+                   const std::optional<double>& disk_busy_percent) {
+  if (!history || max_points == 0) return;
+
+  auto appendValue = [&](std::vector<double>& series, const std::optional<double>& value) {
+    const double next_value = std::max(0.0, std::min(100.0, value.value_or(series.empty() ? 0.0 : series.back())));
+    series.push_back(next_value);
+    if (series.size() > max_points) {
+      series.erase(series.begin(), series.begin() + static_cast<std::ptrdiff_t>(series.size() - max_points));
+    }
+  };
+
+  appendValue(history->cpu_usage, snapshot.cpu.usage_percent);
+  appendValue(history->cpu_temp, snapshot.cpu.temperature_c);
+  
+  if (snapshot.ram.total_kb && snapshot.ram.available_kb && *snapshot.ram.total_kb > 0) {
+    const double ram_pct = 100.0 * (static_cast<double>(*snapshot.ram.total_kb) - 
+                                    static_cast<double>(*snapshot.ram.available_kb)) / 
+                           static_cast<double>(*snapshot.ram.total_kb);
+    appendValue(history->ram_usage, ram_pct);
+  } else {
+    appendValue(history->ram_usage, std::nullopt);
+  }
+
+  if (!snapshot.gpus.empty()) {
+    const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
+    appendValue(history->gpu_usage, gpu.utilization_percent);
+    if (gpu.memory_utilization_percent) {
+      appendValue(history->gpu_vram_usage, gpu.memory_utilization_percent);
+    } else if (gpu.memory_used_mib && gpu.memory_total_mib && *gpu.memory_total_mib > 0) {
+      appendValue(history->gpu_vram_usage, 100.0 * (*gpu.memory_used_mib) / (*gpu.memory_total_mib));
+    } else {
+      appendValue(history->gpu_vram_usage, std::nullopt);
+    }
+  } else {
+    appendValue(history->gpu_usage, std::nullopt);
+    appendValue(history->gpu_vram_usage, std::nullopt);
+  }
+
+  if (disk_busy_percent) {
+    appendValue(history->disk_usage, disk_busy_percent);
+  } else if (snapshot.disk.total_bytes && snapshot.disk.free_bytes && *snapshot.disk.total_bytes > 0) {
+    const double disk_pct = 100.0 * static_cast<double>(*snapshot.disk.total_bytes - *snapshot.disk.free_bytes) /
+                            static_cast<double>(*snapshot.disk.total_bytes);
+    appendValue(history->disk_usage, disk_pct);
+  } else {
+    appendValue(history->disk_usage, std::nullopt);
+  }
 }
 
 void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
@@ -2066,13 +1889,48 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  /* Load plugins dynamically */
+  hmon::core::PluginManager pm;
+
+  /* Try to load from the install directory first, then fall back to build dir */
+  const char* env_plugin_dir = std::getenv("HMON_PLUGIN_DIR");
+  if (env_plugin_dir) {
+    pm.load_directory(env_plugin_dir);
+  } else {
+    pm.load_directory(HMON_PLUGIN_DIR);
+    if (pm.plugin_count() == 0) {
+      pm.load_directory("./");
+    }
+  }
+
+  if (pm.plugin_count() == 0) {
+    endwin();
+    std::cerr << "hmon: no plugins found. Set HMON_PLUGIN_DIR or install plugins.\n";
+    return 1;
+  }
+
+  if (pm.init_all() != 0) {
+    endwin();
+    std::cerr << "hmon: failed to initialise one or more plugins.\n";
+    return 1;
+  }
+
+  std::cout << "hmon: loaded " << pm.plugin_count() << " plugin(s): ";
+  auto names = pm.plugin_names();
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (i > 0) std::cout << ", ";
+    std::cout << names[i];
+  }
+  std::cout << "\n";
+
   const std::string host = hostName();
   MetricsHistory history;
   int refresh_interval_ms = config.refresh_interval_ms;
   bool show_help_overlay = false;
 
-  Snapshot snapshot = collectSnapshot(config);
-  std::vector<ProcessInfo> processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+  pm.collect_all();
+  Snapshot snapshot = collectSnapshot(pm, config);
+  std::vector<ProcessInfo> processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
   syncSelection(processes, &config);
   updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
   renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
@@ -2131,7 +1989,7 @@ int main(int argc, char* argv[]) {
         case SortMode::kGpu: config.sort_mode = SortMode::kPid; break;
         case SortMode::kPid: config.sort_mode = SortMode::kCpu; break;
       }
-      processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+      processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
       syncSelection(processes, &config);
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
       continue;
@@ -2182,8 +2040,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (ch == 'r' || ch == 'R') {
-      snapshot = collectSnapshot(config);
-      processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+      pm.collect_all();
+      snapshot = collectSnapshot(pm, config);
+      processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
       syncSelection(processes, &config);
       updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
@@ -2212,13 +2071,15 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
-    snapshot = collectSnapshot(config);
-    processes = collectTopProcesses(config.top_processes, config.sort_mode, config.lock_pid);
+    pm.collect_all();
+    snapshot = collectSnapshot(pm, config);
+    processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
     syncSelection(processes, &config);
     updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
     renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
   }
 
+  pm.destroy_all();
   endwin();
   return 0;
 }
