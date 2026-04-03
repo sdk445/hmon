@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -76,6 +77,59 @@ static std::string readCmdline(int pid) {
     }
     if (cmdline.size() > 150) cmdline = cmdline.substr(0, 147) + "...";
     return cmdline;
+}
+
+static std::string trim(const std::string& s) {
+    const auto start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    const auto end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+static std::string runCommand(const char* cmd) {
+    std::string result;
+    FILE* pipe = popen(cmd, "r");
+    if (!pipe) return result;
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        result += buffer;
+    }
+    pclose(pipe);
+    return result;
+}
+
+static std::unordered_map<int, double> readGpuUsageByPid() {
+    std::unordered_map<int, double> usage_by_pid;
+    const std::string output = runCommand("nvidia-smi pmon -c 1 2>/dev/null");
+    if (output.empty()) return usage_by_pid;
+
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        int gpu = 0;
+        int pid = 0;
+        std::string type;
+        std::string sm_util;
+        std::string mem_util;
+        std::string enc_util;
+        std::string dec_util;
+        std::string command;
+        if (!(iss >> gpu >> pid >> type >> sm_util >> mem_util >> enc_util >> dec_util >> command)) {
+            continue;
+        }
+        if (pid <= 0 || sm_util == "-") continue;
+
+        try {
+            usage_by_pid[pid] = std::stod(sm_util);
+        } catch (...) {
+        }
+    }
+    return usage_by_pid;
 }
 
 struct ProcInfo {
@@ -169,6 +223,12 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
         e.command = it->command;
         long rss_kb = static_cast<long>(it->rss_pages) * page_size / 1024;
         e.mem_percent = total_mem > 0 ? 100.0 * static_cast<double>(rss_kb) / static_cast<double>(total_mem) : 0.0;
+        if (ctx) {
+            auto gpu_it = ctx->gpu_percent_by_pid.find(it->pid);
+            if (gpu_it != ctx->gpu_percent_by_pid.end()) {
+                e.gpu_percent = gpu_it->second;
+            }
+        }
 
         if (ctx && !ctx->prev_utime.empty()) {
             auto ut = ctx->prev_utime.find(it->pid);
@@ -208,6 +268,10 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
             e.command = pi.command;
             long rss_kb = static_cast<long>(pi.rss_pages) * page_size / 1024;
             e.mem_percent = total_mem > 0 ? 100.0 * static_cast<double>(rss_kb) / static_cast<double>(total_mem) : 0.0;
+            auto gpu_it = ctx->gpu_percent_by_pid.find(pi.pid);
+            if (gpu_it != ctx->gpu_percent_by_pid.end()) {
+                e.gpu_percent = gpu_it->second;
+            }
 
             auto ut = ctx->prev_utime.find(pi.pid);
             auto st = ctx->prev_stime.find(pi.pid);
@@ -225,12 +289,22 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
             e.command = pi.command;
             long rss_kb = static_cast<long>(pi.rss_pages) * page_size / 1024;
             e.mem_percent = total_mem > 0 ? 100.0 * static_cast<double>(rss_kb) / static_cast<double>(total_mem) : 0.0;
+            if (ctx) {
+                auto gpu_it = ctx->gpu_percent_by_pid.find(pi.pid);
+                if (gpu_it != ctx->gpu_percent_by_pid.end()) {
+                    e.gpu_percent = gpu_it->second;
+                }
+            }
             e.cpu_percent = 0.0;
             result.push_back(std::move(e));
         }
     }
 
     switch (sort_mode) {
+        case SortMode::kGpu:
+            std::stable_sort(result.begin(), result.end(),
+                             [](const ProcessEntry& a, const ProcessEntry& b) { return a.gpu_percent > b.gpu_percent; });
+            break;
         case SortMode::kMem:
             std::stable_sort(result.begin(), result.end(),
                              [](const ProcessEntry& a, const ProcessEntry& b) { return a.mem_percent > b.mem_percent; });
@@ -250,6 +324,7 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
     if (ctx) {
         ctx->prev_utime.clear();
         ctx->prev_stime.clear();
+        ctx->gpu_percent_by_pid = readGpuUsageByPid();
         for (const auto& pi : procs) {
             ctx->prev_utime[pi.pid] = pi.utime;
             ctx->prev_stime[pi.pid] = pi.stime;

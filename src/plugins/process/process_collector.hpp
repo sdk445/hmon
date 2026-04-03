@@ -22,6 +22,7 @@ struct ProcessPluginCtx {
     int lock_pid = -1;
     std::unordered_map<int, uint64_t> prev_utime;
     std::unordered_map<int, uint64_t> prev_stime;
+    std::unordered_map<int, double> gpu_percent_by_pid;
     std::chrono::steady_clock::time_point prev_time;
     long total_mem_kb = 0;
 };
