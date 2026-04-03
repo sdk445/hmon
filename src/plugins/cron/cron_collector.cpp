@@ -1,5 +1,6 @@
 #include "cron_collector.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -67,13 +68,19 @@ static void parseCrontab(const std::string& path, const std::string& source,
 
 namespace hmon::plugins::cron {
 
-std::vector<CronJob> collectCronJobs(CronPluginCtx* /*ctx*/) {
+std::vector<CronJob> collectCronJobs(CronPluginCtx* ctx) {
+    if (ctx) {
+        auto elapsed = std::chrono::steady_clock::now() - ctx->last_cache_time;
+        if (!ctx->cached_result.empty() &&
+            std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < CronPluginCtx::TTL_SECONDS) {
+            return ctx->cached_result;
+        }
+    }
+
     std::vector<CronJob> jobs;
 
-    /* /etc/crontab */
     parseCrontab("/etc/crontab", "/etc/crontab", "root", jobs);
 
-    /* /etc/cron.d/* */
     std::error_code ec;
     if (fs::exists("/etc/cron.d", ec)) {
         for (const auto& entry : fs::directory_iterator("/etc/cron.d", ec)) {
@@ -83,7 +90,6 @@ std::vector<CronJob> collectCronJobs(CronPluginCtx* /*ctx*/) {
         }
     }
 
-    /* User crontabs in /var/spool/cron/ or /var/spool/cron/crontabs/ */
     std::string crontab_dir = "/var/spool/cron";
     if (!fs::exists(crontab_dir, ec)) {
         crontab_dir = "/var/spool/cron/crontabs";
@@ -97,6 +103,10 @@ std::vector<CronJob> collectCronJobs(CronPluginCtx* /*ctx*/) {
         }
     }
 
+    if (ctx) {
+        ctx->cached_result = jobs;
+        ctx->last_cache_time = std::chrono::steady_clock::now();
+    }
     return jobs;
 }
 

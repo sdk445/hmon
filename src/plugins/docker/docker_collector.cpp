@@ -465,12 +465,6 @@ namespace hmon::plugins::docker {
 void startBackgroundCollector(DockerPluginCtx* ctx) {
     if (ctx->running) return;
     ctx->running = true;
-    auto fresh = doCollect(ctx->socket_path, ctx->containers);
-    {
-        std::lock_guard<std::mutex> lock(ctx->data_mutex);
-        ctx->containers = std::move(fresh);
-        if (!ctx->containers.empty()) ctx->has_data = true;
-    }
     ctx->worker = std::thread([ctx]() {
         while (ctx->running) {
             auto fresh = doCollect(ctx->socket_path, ctx->containers);

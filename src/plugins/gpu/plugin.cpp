@@ -4,15 +4,13 @@
 #include <vector>
 
 #include "hmon/plugin_abi.h"
+#include "hmon/static_plugins.hpp"
 #include "gpu_collector.hpp"
 
-HMON_DECLARE_PLUGIN("gpu")
 
 struct GpuContext {};
 
-extern "C" {
-
-HMON_PLUGIN_EXPORT int hmon_plugin_init(hmon_plugin_ctx** out) {
+static int gpu_plugin_init(hmon_plugin_ctx** out) {
     if (!out) return -1;
     auto* ctx = new (std::nothrow) GpuContext();
     if (!ctx) return -1;
@@ -28,11 +26,9 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
         list->items = new_items;
         list->capacity = new_cap;
     }
-
     auto* item = &list->items[list->count];
     item->key = key;
     item->value.type = type;
-
     switch (type) {
     case HMON_VAL_STRING: {
         const char* src = static_cast<const char*>(value);
@@ -53,22 +49,17 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
     ++list->count;
 }
 
-HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
+static int gpu_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
     (void)ctx;
     if (!out_list) return -1;
-
     auto gpus = hmon::plugins::gpu::collectGpus();
-
     for (size_t i = 0; i < gpus.size(); ++i) {
         const auto& g = gpus[i];
         char key[128];
-
         std::snprintf(key, sizeof(key), "gpu.%zu.name", i);
         appendMetric(out_list, strdup(key), HMON_VAL_STRING, g.name.c_str());
-
         std::snprintf(key, sizeof(key), "gpu.%zu.source", i);
         appendMetric(out_list, strdup(key), HMON_VAL_STRING, g.source.c_str());
-
         if (g.temperature_c) {
             std::snprintf(key, sizeof(key), "gpu.%zu.temp_c", i);
             double v = *g.temperature_c;
@@ -109,30 +100,25 @@ HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_lis
             int32_t v = *g.in_use ? 1 : 0;
             appendMetric(out_list, strdup(key), HMON_VAL_BOOL, &v);
         }
-
         for (size_t c = 0; c < g.gpu_core_usage_percent.size(); ++c) {
             std::snprintf(key, sizeof(key), "gpu.%zu.core_usage.%zu", i, c);
             double v = g.gpu_core_usage_percent[c];
             appendMetric(out_list, strdup(key), HMON_VAL_DOUBLE, &v);
         }
     }
-
     return 0;
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_destroy(hmon_plugin_ctx* ctx) {
+static void gpu_plugin_destroy(hmon_plugin_ctx* ctx) {
     if (!ctx) return;
-    auto* c = reinterpret_cast<GpuContext*>(ctx);
-    delete c;
+    delete reinterpret_cast<GpuContext*>(ctx);
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
+static void gpu_plugin_free_list(hmon_metric_list* list) {
     if (!list) return;
     for (size_t i = 0; i < list->count; ++i) {
-        if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str) {
+        if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str)
             free(const_cast<char*>(list->items[i].value.v.str));
-        }
-        /* Keys that were strdup'd also need freeing. */
         free(const_cast<char*>(list->items[i].key));
     }
     free(list->items);
@@ -141,4 +127,4 @@ HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
     list->capacity = 0;
 }
 
-} /* extern "C" */
+HMON_STATIC_PLUGIN("gpu", gpu_plugin_init, gpu_plugin_collect, gpu_plugin_destroy, gpu_plugin_free_list, nullptr)

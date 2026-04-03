@@ -4,17 +4,15 @@
 #include <vector>
 
 #include "hmon/plugin_abi.h"
+#include "hmon/static_plugins.hpp"
 #include "cpu_collector.hpp"
 
-HMON_DECLARE_PLUGIN("cpu")
 
 struct CpuContext {
     hmon::plugins::cpu::CpuPluginCtx collector;
 };
 
-extern "C" {
-
-HMON_PLUGIN_EXPORT int hmon_plugin_init(hmon_plugin_ctx** out) {
+static int cpu_plugin_init(hmon_plugin_ctx** out) {
     if (!out) return -1;
     auto* ctx = new (std::nothrow) CpuContext();
     if (!ctx) return -1;
@@ -30,11 +28,9 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
         list->items = new_items;
         list->capacity = new_cap;
     }
-
     auto* item = &list->items[list->count];
     item->key = key;
     item->value.type = type;
-
     switch (type) {
     case HMON_VAL_STRING: {
         const char* src = static_cast<const char*>(value);
@@ -55,33 +51,25 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
     ++list->count;
 }
 
-HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
+static int cpu_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
     if (!ctx || !out_list) return -1;
-
     auto* c = reinterpret_cast<CpuContext*>(ctx);
 
     std::string name = hmon::plugins::cpu::collectName();
     int64_t cores = 0, threads = 0;
     double temp = 0.0, freq = 0.0, usage = 0.0;
-
-    bool has_cores = false, has_threads = false;
-    bool has_temp = false, has_freq = false, has_usage = false;
+    bool has_cores = false, has_threads = false, has_temp = false, has_freq = false, has_usage = false;
 
     auto tc = hmon::plugins::cpu::collectThreadCount();
     if (tc) { threads = *tc; has_threads = true; }
-
     auto cc = hmon::plugins::cpu::collectCoreCount();
     if (cc) { cores = *cc; has_cores = true; }
-
     auto t = hmon::plugins::cpu::collectTemperature();
     if (t) { temp = *t; has_temp = true; }
-
     auto f = hmon::plugins::cpu::collectFrequency();
     if (f) { freq = *f; has_freq = true; }
-
     auto u = hmon::plugins::cpu::collectUsagePercent(&c->collector);
     if (u) { usage = *u; has_usage = true; }
-
     auto per_core = hmon::plugins::cpu::collectPerCoreUsagePercent(&c->collector);
 
     appendMetric(out_list, HMON_METRIC_CPU_NAME, HMON_VAL_STRING, name.c_str());
@@ -97,24 +85,20 @@ HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_lis
         double val = per_core[i];
         appendMetric(out_list, strdup(key), HMON_VAL_DOUBLE, &val);
     }
-
     return 0;
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_destroy(hmon_plugin_ctx* ctx) {
+static void cpu_plugin_destroy(hmon_plugin_ctx* ctx) {
     if (!ctx) return;
-    auto* c = reinterpret_cast<CpuContext*>(ctx);
-    delete c;
+    delete reinterpret_cast<CpuContext*>(ctx);
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
+static void cpu_plugin_free_list(hmon_metric_list* list) {
     if (!list) return;
     for (size_t i = 0; i < list->count; ++i) {
         if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str) {
-            /* Only free strings we strdup'd (keys starting with cpu.core_usage_pct). */
-            if (std::strncmp(list->items[i].key, "cpu.core_usage_pct", 18) == 0) {
+            if (std::strncmp(list->items[i].key, "cpu.core_usage_pct", 18) == 0)
                 free(const_cast<char*>(list->items[i].key));
-            }
             free(const_cast<char*>(list->items[i].value.v.str));
         }
     }
@@ -124,4 +108,4 @@ HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
     list->capacity = 0;
 }
 
-} /* extern "C" */
+HMON_STATIC_PLUGIN("cpu", cpu_plugin_init, cpu_plugin_collect, cpu_plugin_destroy, cpu_plugin_free_list, nullptr)

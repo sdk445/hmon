@@ -1,8 +1,11 @@
 #include "database_collector.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -25,14 +28,39 @@ static std::string runCmd(const std::string& cmd) {
 }
 
 static bool cmdExists(const std::string& cmd) {
-    return runCmd("which " + cmd + " 2>/dev/null").size() > 0;
+    static std::unordered_map<std::string, bool> cache;
+    auto it = cache.find(cmd);
+    if (it != cache.end()) return it->second;
+
+    std::string paths[] = {
+        "/usr/bin/" + cmd,
+        "/usr/local/bin/" + cmd,
+        "/bin/" + cmd,
+        "/snap/bin/" + cmd
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), X_OK) == 0) {
+            cache[cmd] = true;
+            return true;
+        }
+    }
+    cache[cmd] = false;
+    return false;
 }
 
 }
 
 namespace hmon::plugins::database {
 
-std::vector<DbInfo> collectDatabases(DatabasePluginCtx* /*ctx*/) {
+std::vector<DbInfo> collectDatabases(DatabasePluginCtx* ctx) {
+    if (ctx) {
+        auto elapsed = std::chrono::steady_clock::now() - ctx->last_cache_time;
+        if (!ctx->cached_result.empty() &&
+            std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < DatabasePluginCtx::TTL_SECONDS) {
+            return ctx->cached_result;
+        }
+    }
+
     std::vector<DbInfo> result;
 
     /* PostgreSQL */
@@ -155,6 +183,10 @@ std::vector<DbInfo> collectDatabases(DatabasePluginCtx* /*ctx*/) {
         result.push_back(std::move(db));
     }
 
+    if (ctx) {
+        ctx->cached_result = result;
+        ctx->last_cache_time = std::chrono::steady_clock::now();
+    }
     return result;
 }
 

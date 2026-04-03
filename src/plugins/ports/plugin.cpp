@@ -4,9 +4,18 @@
 #include <vector>
 
 #include "hmon/plugin_abi.h"
+#include "hmon/static_plugins.hpp"
 #include "ports_collector.hpp"
 
-HMON_DECLARE_PLUGIN("ports")
+
+extern "C" {
+    int hmon_plugin_init(hmon_plugin_ctx**);
+    int hmon_plugin_collect(hmon_plugin_ctx*, hmon_metric_list*);
+    void hmon_plugin_destroy(hmon_plugin_ctx*);
+    void hmon_plugin_free_list(hmon_metric_list*);
+}
+
+HMON_STATIC_PLUGIN("ports", hmon_plugin_init, hmon_plugin_collect, hmon_plugin_destroy, hmon_plugin_free_list, nullptr)
 
 extern "C" {
 
@@ -32,8 +41,7 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
     switch (type) {
     case HMON_VAL_STRING: {
         const char* src = static_cast<const char*>(value);
-        char* dup = strdup(src ? src : "");
-        item->value.v.str = dup;
+        item->value.v.str = strdup(src ? src : "");
         break;
     }
     case HMON_VAL_INT64:

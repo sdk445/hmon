@@ -10,222 +10,51 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(HMON_ENABLE_CLANG_TIDY "Run clang-tidy globally during C++ compilation" OFF)
-set(HMON_PLUGIN_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/hmon/plugins" CACHE STRING "Directory where plugins are installed")
 
-# ── Core library (libhmoncore.so) ──────────────────────────────────────────
-
-add_library(hmoncore SHARED
-  src/core/plugin_manager.cpp
-)
-
-target_include_directories(hmoncore PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-target_link_libraries(hmoncore PRIVATE dl)
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmoncore PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-set_target_properties(hmoncore PROPERTIES
-  VERSION ${PROJECT_VERSION}
-  SOVERSION 1
-)
-
-# ── Plugins ────────────────────────────────────────────────────────────────
-
-# CPU plugin
-add_library(hmon_cpu SHARED
-  src/plugins/cpu/cpu_collector.cpp
-  src/plugins/cpu/plugin.cpp
-)
-target_include_directories(hmon_cpu PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/cpu
-)
-set_target_properties(hmon_cpu PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_cpu PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# GPU plugin
-add_library(hmon_gpu SHARED
-  src/plugins/gpu/gpu_collector.cpp
-  src/plugins/gpu/plugin.cpp
-)
-target_include_directories(hmon_gpu PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/gpu
-)
-set_target_properties(hmon_gpu PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_gpu PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# System plugin (RAM, Disk, Network)
-add_library(hmon_system SHARED
-  src/plugins/system/system_collector.cpp
-  src/plugins/system/plugin.cpp
-)
-target_include_directories(hmon_system PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/system
-)
-set_target_properties(hmon_system PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_system PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Process plugin
-add_library(hmon_process SHARED
-  src/plugins/process/process_collector.cpp
-  src/plugins/process/plugin.cpp
-)
-target_include_directories(hmon_process PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/process
-)
-set_target_properties(hmon_process PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_process PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Docker plugin
-add_library(hmon_docker SHARED
-  src/plugins/docker/docker_collector.cpp
-  src/plugins/docker/plugin.cpp
-)
-target_include_directories(hmon_docker PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/docker
-)
-set_target_properties(hmon_docker PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_docker PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Ports plugin
-add_library(hmon_ports SHARED
-  src/plugins/ports/ports_collector.cpp
-  src/plugins/ports/plugin.cpp
-)
-target_include_directories(hmon_ports PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/ports
-)
-set_target_properties(hmon_ports PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_ports PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Systemd plugin
-add_library(hmon_systemd SHARED
-  src/plugins/systemd/systemd_collector.cpp
-  src/plugins/systemd/plugin.cpp
-)
-target_include_directories(hmon_systemd PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/systemd
-)
-set_target_properties(hmon_systemd PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_systemd PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Database plugin
-add_library(hmon_database SHARED
-  src/plugins/database/database_collector.cpp
-  src/plugins/database/plugin.cpp
-)
-target_include_directories(hmon_database PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/database
-)
-set_target_properties(hmon_database PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_database PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Webserver plugin
-add_library(hmon_webserver SHARED
-  src/plugins/webserver/webserver_collector.cpp
-  src/plugins/webserver/plugin.cpp
-)
-target_include_directories(hmon_webserver PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/webserver
-)
-set_target_properties(hmon_webserver PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_webserver PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Cron plugin
-add_library(hmon_cron SHARED
-  src/plugins/cron/cron_collector.cpp
-  src/plugins/cron/plugin.cpp
-)
-target_include_directories(hmon_cron PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/cron
-)
-set_target_properties(hmon_cron PROPERTIES
-  PREFIX "lib"
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(hmon_cron PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# ── Main executable ───────────────────────────────────────────────────────
+# ── Single binary: all sources compiled together ───────────────────────────
 
 find_package(Curses REQUIRED)
 
-add_executable(hmon src/main.cpp)
+set(HMON_SOURCES
+  src/main.cpp
+  src/core/plugin_manager.cpp
+  src/core/static_plugins.cpp
+  src/plugins/cpu/cpu_collector.cpp
+  src/plugins/cpu/plugin.cpp
+  src/plugins/gpu/gpu_collector.cpp
+  src/plugins/gpu/plugin.cpp
+  src/plugins/system/system_collector.cpp
+  src/plugins/system/plugin.cpp
+  src/plugins/process/process_collector.cpp
+  src/plugins/process/plugin.cpp
+  src/plugins/docker/docker_collector.cpp
+  src/plugins/docker/plugin.cpp
+  src/plugins/ports/ports_collector.cpp
+  src/plugins/ports/plugin.cpp
+  src/plugins/systemd/systemd_collector.cpp
+  src/plugins/systemd/plugin.cpp
+  src/plugins/database/database_collector.cpp
+  src/plugins/database/plugin.cpp
+  src/plugins/webserver/webserver_collector.cpp
+  src/plugins/webserver/plugin.cpp
+  src/plugins/cron/cron_collector.cpp
+  src/plugins/cron/plugin.cpp
+)
+
+add_executable(hmon ${HMON_SOURCES})
 target_include_directories(hmon PRIVATE
   ${CURSES_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_compile_definitions(hmon PRIVATE
-  HMON_PLUGIN_DIR="${CMAKE_INSTALL_FULL_LIBDIR}/hmon/plugins"
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/cpu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/gpu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/system
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/process
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/docker
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/ports
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/systemd
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/database
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/webserver
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/plugins/cron
 )
 
 find_library(NCURSESW_LIBRARY NAMES ncursesw)
@@ -235,79 +64,31 @@ else()
   target_link_libraries(hmon PRIVATE ${CURSES_LIBRARIES})
 endif()
 
-target_link_libraries(hmon PRIVATE hmoncore dl)
-
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hmon PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# RPATH so the binary finds libhmoncore.so at runtime
-set_target_properties(hmon PROPERTIES
-  INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
-  BUILD_RPATH "\$ORIGIN"
-  INSTALL_RPATH_USE_LINK_PATH ON
-)
+# ── Install ────────────────────────────────────────────────────────────────
 
-# ── Install rules ──────────────────────────────────────────────────────────
-
-install(TARGETS hmon
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-
-install(TARGETS hmoncore
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-install(DIRECTORY include/hmon
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
-)
-
-# Install plugins to the plugin directory
-install(TARGETS hmon_cpu hmon_gpu hmon_system hmon_process hmon_docker hmon_ports hmon_systemd hmon_database hmon_webserver hmon_cron
-  LIBRARY DESTINATION "${HMON_PLUGIN_DIR}"
-)
+install(TARGETS hmon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY include/hmon DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 
 # ── clang-tidy ─────────────────────────────────────────────────────────────
 
 find_program(CLANG_TIDY_EXE NAMES clang-tidy)
-
-if(HMON_ENABLE_CLANG_TIDY)
-  if(NOT CLANG_TIDY_EXE)
-    message(FATAL_ERROR "HMON_ENABLE_CLANG_TIDY is ON, but clang-tidy was not found in PATH.")
-  endif()
-  set(CMAKE_CXX_CLANG_TIDY
-      ${CLANG_TIDY_EXE};
-      --config-file=${CMAKE_CURRENT_SOURCE_DIR}/.clang-tidy)
-endif()
-
 if(CLANG_TIDY_EXE)
-  set(ALL_SOURCES
-    src/main.cpp
-    src/core/plugin_manager.cpp
-    src/plugins/cpu/cpu_collector.cpp src/plugins/cpu/plugin.cpp
-    src/plugins/gpu/gpu_collector.cpp src/plugins/gpu/plugin.cpp
-    src/plugins/system/system_collector.cpp src/plugins/system/plugin.cpp
-    src/plugins/process/process_collector.cpp src/plugins/process/plugin.cpp
-    src/plugins/docker/docker_collector.cpp src/plugins/docker/plugin.cpp
-    src/plugins/ports/ports_collector.cpp src/plugins/ports/plugin.cpp
-    src/plugins/systemd/systemd_collector.cpp src/plugins/systemd/plugin.cpp
-    src/plugins/database/database_collector.cpp src/plugins/database/plugin.cpp
-    src/plugins/webserver/webserver_collector.cpp src/plugins/webserver/plugin.cpp
-    src/plugins/cron/cron_collector.cpp src/plugins/cron/plugin.cpp
-  )
   add_custom_target(lint
-    COMMAND ${CLANG_TIDY_EXE}
-            -p ${CMAKE_BINARY_DIR}
+    COMMAND ${CLANG_TIDY_EXE} -p ${CMAKE_BINARY_DIR}
             --config-file=${CMAKE_CURRENT_SOURCE_DIR}/.clang-tidy
-            ${ALL_SOURCES}
+            ${HMON_SOURCES}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Running clang-tidy lint checks"
+    COMMENT "Running clang-tidy"
     VERBATIM
   )
 else()
   add_custom_target(lint
-    COMMAND ${CMAKE_COMMAND} -E echo "clang-tidy not found. Install clang-tidy to enable lint checks."
+    COMMAND ${CMAKE_COMMAND} -E echo "clang-tidy not found."
     VERBATIM
   )
 endif()

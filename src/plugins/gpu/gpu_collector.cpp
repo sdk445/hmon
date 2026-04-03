@@ -256,12 +256,10 @@ std::vector<hmon::plugins::gpu::GpuInfo> fromNvidiaSmi() {
     return result;
 }
 
-std::vector<hmon::plugins::gpu::GpuInfo> fromSysfs() {
+std::vector<hmon::plugins::gpu::GpuInfo> fromSysfs(std::optional<double> sensors_power) {
     std::vector<hmon::plugins::gpu::GpuInfo> result;
     const fs::path drm("/sys/class/drm");
     if (!fs::exists(drm)) return result;
-
-    auto sensors_power = readSensorsPower();
 
     for (const auto& card : fs::directory_iterator(drm)) {
         std::string name = card.path().filename().string();
@@ -337,7 +335,8 @@ namespace hmon::plugins::gpu {
 
 std::vector<GpuInfo> collectGpus() {
     auto nvidia = fromNvidiaSmi();
-    auto sysfs = fromSysfs();
+    auto sensors_power = readSensorsPower();
+    auto sysfs = fromSysfs(sensors_power);
 
     if (!nvidia.empty()) {
         std::vector<bool> sysfs_used(sysfs.size(), false);
@@ -371,7 +370,6 @@ std::vector<GpuInfo> collectGpus() {
             if (!base.in_use.has_value() && extra->in_use.has_value()) base.in_use = extra->in_use;
         }
 
-        auto sensors_power = readSensorsPower();
         for (auto& g : nvidia) {
             if (!g.power_w && sensors_power) g.power_w = sensors_power;
             if (!g.memory_utilization_percent && g.memory_used_mib && g.memory_total_mib && *g.memory_total_mib > 0.0) {

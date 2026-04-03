@@ -1,9 +1,16 @@
 #include "webserver_collector.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -25,7 +32,41 @@ static std::string runCmd(const std::string& cmd) {
 }
 
 static bool cmdExists(const std::string& cmd) {
-    return runCmd("which " + cmd + " 2>/dev/null").size() > 0;
+    static std::unordered_map<std::string, bool> cache;
+    auto it = cache.find(cmd);
+    if (it != cache.end()) return it->second;
+    std::string paths[] = {
+        "/usr/bin/" + cmd,
+        "/usr/local/bin/" + cmd,
+        "/bin/" + cmd,
+        "/snap/bin/" + cmd
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), X_OK) == 0) {
+            cache[cmd] = true;
+            return true;
+        }
+    }
+    cache[cmd] = false;
+    return false;
+}
+
+static bool systemdServiceActive(const std::string& name) {
+    std::vector<fs::path> cgroup_paths = {
+        fs::path("/sys/fs/cgroup/system.slice") / (name + ".service"),
+        fs::path("/sys/fs/cgroup/systemd/system.slice") / (name + ".service"),
+    };
+    for (const auto& p : cgroup_paths) {
+        if (fs::exists(p)) {
+            fs::path procs = p / "cgroup.procs";
+            std::ifstream f(procs);
+            if (f) {
+                std::string line;
+                if (std::getline(f, line) && !trim(line).empty()) return true;
+            }
+        }
+    }
+    return false;
 }
 
 static std::string httpGet(const std::string& url, int timeout_ms = 1000) {
@@ -39,15 +80,21 @@ static std::string httpGet(const std::string& url, int timeout_ms = 1000) {
 namespace hmon::plugins::webserver {
 
 std::vector<WebServerInfo> collectWebServers(WebServerPluginCtx* ctx) {
+    if (ctx) {
+        auto elapsed = std::chrono::steady_clock::now() - ctx->last_cache_time;
+        if (!ctx->cached_result.empty() &&
+            std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < WebServerPluginCtx::TTL_SECONDS) {
+            return ctx->cached_result;
+        }
+    }
+
     std::vector<WebServerInfo> result;
 
-    /* Nginx */
-    if (cmdExists("nginx") || runCmd("systemctl is-active nginx 2>/dev/null") == "active") {
+    if (cmdExists("nginx") || systemdServiceActive("nginx")) {
         WebServerInfo ws;
         ws.type = "nginx";
-        ws.status = (runCmd("systemctl is-active nginx 2>/dev/null") == "active") ? "running" : "stopped";
+        ws.status = systemdServiceActive("nginx") ? "running" : "stopped";
         if (ws.status == "running") {
-            /* Try stub_status endpoint */
             std::string status = httpGet("http://127.0.0.1/nginx_status");
             if (status.empty()) status = httpGet("http://127.0.0.1:8080/nginx_status");
             if (!status.empty() && status.find("Active connections") != std::string::npos) {
@@ -58,8 +105,6 @@ std::vector<WebServerInfo> collectWebServers(WebServerPluginCtx* ctx) {
                     if (line.rfind("Active connections:", 0) == 0) {
                         try { ws.active_connections = std::stoi(line.substr(19)); } catch (...) {}
                     }
-                    /* Lines: server accepts handled requests */
-                    /* Then: N N N where N is total requests */
                     if (line.find(" ") != std::string::npos && line.find(":") == std::string::npos) {
                         std::istringstream iss2(line);
                         int64_t accepts, handled, requests;
@@ -73,21 +118,15 @@ std::vector<WebServerInfo> collectWebServers(WebServerPluginCtx* ctx) {
                     }
                 }
             }
-            /* Get uptime from systemctl */
-            std::string uptime_str = runCmd("systemctl show nginx --property=ActiveEnterTimestamp 2>/dev/null");
-            /* Just mark as running, detailed uptime would need more parsing */
         }
         result.push_back(std::move(ws));
     }
 
-    /* Apache */
     if (cmdExists("apache2") || cmdExists("httpd") ||
-        runCmd("systemctl is-active apache2 2>/dev/null") == "active" ||
-        runCmd("systemctl is-active httpd 2>/dev/null") == "active") {
+        systemdServiceActive("apache2") || systemdServiceActive("httpd")) {
         WebServerInfo ws;
         ws.type = "apache";
-        ws.status = (runCmd("systemctl is-active apache2 2>/dev/null") == "active" ||
-                     runCmd("systemctl is-active httpd 2>/dev/null") == "active") ? "running" : "stopped";
+        ws.status = (systemdServiceActive("apache2") || systemdServiceActive("httpd")) ? "running" : "stopped";
         if (ws.status == "running") {
             std::string status = httpGet("http://127.0.0.1/server-status?auto");
             if (status.empty()) status = httpGet("http://127.0.0.1:8080/server-status?auto");
@@ -115,6 +154,10 @@ std::vector<WebServerInfo> collectWebServers(WebServerPluginCtx* ctx) {
         result.push_back(std::move(ws));
     }
 
+    if (ctx) {
+        ctx->cached_result = result;
+        ctx->last_cache_time = std::chrono::steady_clock::now();
+    }
     return result;
 }
 

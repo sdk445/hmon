@@ -4,13 +4,22 @@
 #include <vector>
 
 #include "hmon/plugin_abi.h"
+#include "hmon/static_plugins.hpp"
 #include "database_collector.hpp"
 
-HMON_DECLARE_PLUGIN("database")
+
+extern "C" {
+    int database_plugin_init(hmon_plugin_ctx**);
+    int database_plugin_collect(hmon_plugin_ctx*, hmon_metric_list*);
+    void database_plugin_destroy(hmon_plugin_ctx*);
+    void database_plugin_free_list(hmon_metric_list*);
+}
+
+HMON_STATIC_PLUGIN("database", database_plugin_init, database_plugin_collect, database_plugin_destroy, database_plugin_free_list, nullptr)
 
 extern "C" {
 
-HMON_PLUGIN_EXPORT int hmon_plugin_init(hmon_plugin_ctx** out) {
+HMON_PLUGIN_EXPORT int database_plugin_init(hmon_plugin_ctx** out) {
     if (!out) return -1;
     auto* ctx = new (std::nothrow) hmon::plugins::database::DatabasePluginCtx();
     if (!ctx) return -1;
@@ -30,25 +39,15 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
     item->key = key;
     item->value.type = type;
     switch (type) {
-    case HMON_VAL_STRING: {
-        const char* src = static_cast<const char*>(value);
-        item->value.v.str = strdup(src ? src : "");
-        break;
-    }
-    case HMON_VAL_INT64:
-        item->value.v.i64 = *static_cast<const int64_t*>(value);
-        break;
-    case HMON_VAL_DOUBLE:
-        item->value.v.f64 = *static_cast<const double*>(value);
-        break;
-    case HMON_VAL_BOOL:
-        item->value.v.b = *static_cast<const int32_t*>(value);
-        break;
+    case HMON_VAL_STRING: item->value.v.str = strdup(static_cast<const char*>(value) ? static_cast<const char*>(value) : ""); break;
+    case HMON_VAL_INT64: item->value.v.i64 = *static_cast<const int64_t*>(value); break;
+    case HMON_VAL_DOUBLE: item->value.v.f64 = *static_cast<const double*>(value); break;
+    case HMON_VAL_BOOL: item->value.v.b = *static_cast<const int32_t*>(value); break;
     }
     ++list->count;
 }
 
-HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
+HMON_PLUGIN_EXPORT int database_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
     if (!ctx || !out_list) return -1;
     auto* c = reinterpret_cast<hmon::plugins::database::DatabasePluginCtx*>(ctx);
     auto dbs = hmon::plugins::database::collectDatabases(c);
@@ -74,12 +73,12 @@ HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_lis
     return 0;
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_destroy(hmon_plugin_ctx* ctx) {
+HMON_PLUGIN_EXPORT void database_plugin_destroy(hmon_plugin_ctx* ctx) {
     if (!ctx) return;
     delete reinterpret_cast<hmon::plugins::database::DatabasePluginCtx*>(ctx);
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
+HMON_PLUGIN_EXPORT void database_plugin_free_list(hmon_metric_list* list) {
     if (!list) return;
     for (size_t i = 0; i < list->count; ++i) {
         if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str)

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace hmon::plugins::process {
@@ -18,8 +20,12 @@ struct ProcessEntry {
 struct ProcessPluginCtx {
     SortMode sort_mode = SortMode::kCpu;
     int lock_pid = -1;
+    std::unordered_map<int, uint64_t> prev_utime;
+    std::unordered_map<int, uint64_t> prev_stime;
+    std::chrono::steady_clock::time_point prev_time;
+    long total_mem_kb = 0;
 };
 
-std::vector<ProcessEntry> collectTopProcesses(size_t limit, SortMode sort_mode, int lock_pid);
+std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limit, SortMode sort_mode, int lock_pid);
 
 }

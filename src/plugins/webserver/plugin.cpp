@@ -4,13 +4,25 @@
 #include <vector>
 
 #include "hmon/plugin_abi.h"
+#include "hmon/static_plugins.hpp"
 #include "webserver_collector.hpp"
 
-HMON_DECLARE_PLUGIN("webserver")
+
+#include "hmon/static_plugins.hpp"
+
+
+extern "C" {
+    int webserver_plugin_init(hmon_plugin_ctx**);
+    int webserver_plugin_collect(hmon_plugin_ctx*, hmon_metric_list*);
+    void webserver_plugin_destroy(hmon_plugin_ctx*);
+    void webserver_plugin_free_list(hmon_metric_list*);
+}
+
+HMON_STATIC_PLUGIN("webserver", webserver_plugin_init, webserver_plugin_collect, webserver_plugin_destroy, webserver_plugin_free_list, nullptr)
 
 extern "C" {
 
-HMON_PLUGIN_EXPORT int hmon_plugin_init(hmon_plugin_ctx** out) {
+HMON_PLUGIN_EXPORT int webserver_plugin_init(hmon_plugin_ctx** out) {
     if (!out) return -1;
     auto* ctx = new (std::nothrow) hmon::plugins::webserver::WebServerPluginCtx();
     if (!ctx) return -1;
@@ -48,7 +60,7 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
     ++list->count;
 }
 
-HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
+HMON_PLUGIN_EXPORT int webserver_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
     if (!ctx || !out_list) return -1;
     auto* c = reinterpret_cast<hmon::plugins::webserver::WebServerPluginCtx*>(ctx);
     auto servers = hmon::plugins::webserver::collectWebServers(c);
@@ -72,12 +84,12 @@ HMON_PLUGIN_EXPORT int hmon_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_lis
     return 0;
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_destroy(hmon_plugin_ctx* ctx) {
+HMON_PLUGIN_EXPORT void webserver_plugin_destroy(hmon_plugin_ctx* ctx) {
     if (!ctx) return;
     delete reinterpret_cast<hmon::plugins::webserver::WebServerPluginCtx*>(ctx);
 }
 
-HMON_PLUGIN_EXPORT void hmon_plugin_free_list(hmon_metric_list* list) {
+HMON_PLUGIN_EXPORT void webserver_plugin_free_list(hmon_metric_list* list) {
     if (!list) return;
     for (size_t i = 0; i < list->count; ++i) {
         if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str)

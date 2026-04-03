@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -44,6 +45,7 @@
 
 #include "hmon/plugin_abi.h"
 #include "hmon/plugin_manager.hpp"
+#include "hmon/embed_plugins.hpp"
 #include "metrics/types.hpp"
 #include "metrics/version.hpp"
 
@@ -1230,7 +1232,7 @@ std::string formatPercentText(double value) {
 }
 
 void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
-                   const std::vector<ProcessInfo>& processes) {
+                   const std::vector<ProcessInfo>& processes, bool loading = false) {
   if (!win) return;
 
   int max_y, max_x;
@@ -1243,6 +1245,15 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
   int row = 1;
 
   drawZenSectionHeader(win, row++, margin, content_w, "CPU Cores", 4);
+
+  if (loading) {
+    attron(A_BOLD);
+    addClippedText(win, row++, margin + 1, content_w - 2, "Collecting system metrics...");
+    attroff(A_BOLD);
+    wnoutrefresh(win);
+    return;
+  }
+
   row++;
 
   if (!snapshot.cpu.core_usage_percent.empty()) {
@@ -2099,7 +2110,7 @@ void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max
 
 void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
                     const std::vector<ProcessInfo>& processes, const std::string& host,
-                    const Config& config, int refresh_interval_ms) {
+                    const Config& config, int refresh_interval_ms, bool loading = false) {
   erase();
 
   int rows = 0, cols = 0;
@@ -2115,7 +2126,7 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   }
 
   if (config.zen_mode) {
-    renderZenMode(stdscr, snapshot, config, processes);
+    renderZenMode(stdscr, snapshot, config, processes, loading);
     doupdate();
     return;
   }
@@ -2156,6 +2167,12 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
   attron(A_REVERSE);
   mvaddnstr(rows - 1, 0, shortcuts.c_str(), cols);
   attroff(A_REVERSE);
+
+  if (loading) {
+    attron(A_BOLD);
+    mvaddnstr(3, 2, "Collecting system metrics...", cols - 4);
+    attroff(A_BOLD);
+  }
 
   const int top = 2;
   const int gap = 1;
@@ -2247,19 +2264,11 @@ int main(int argc, char* argv[]) {
   /* Load plugins BEFORE ncurses so errors don't corrupt the display */
   hmon::core::PluginManager pm;
 
-  const char* env_plugin_dir = std::getenv("HMON_PLUGIN_DIR");
-  if (env_plugin_dir) {
-    pm.load_directory(env_plugin_dir);
-  } else {
-    /* Try build directory first (for development), then install path */
-    pm.load_directory("./");
-    if (pm.plugin_count() == 0) {
-      pm.load_directory(HMON_PLUGIN_DIR);
-    }
-  }
+  /* Load all statically linked plugins — instant, zero I/O */
+  pm.load_static();
 
   if (pm.plugin_count() == 0) {
-    std::cerr << "hmon: no plugins found. Set HMON_PLUGIN_DIR or run from build directory.\n";
+    std::cerr << "hmon: no plugins found.\n";
     return 1;
   }
 
@@ -2313,12 +2322,19 @@ int main(int argc, char* argv[]) {
   int refresh_interval_ms = config.refresh_interval_ms;
   bool show_help_overlay = false;
 
-  pm.collect_all();
+  renderSnapshot(Snapshot{}, history, {}, host, config, refresh_interval_ms, true);
+
+  auto collect_future = std::async(std::launch::async, [&]() {
+    pm.collect_all();
+  });
+
+  collect_future.wait();
+
   Snapshot snapshot = collectSnapshot(pm, config);
   std::vector<ProcessInfo> processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
   syncSelection(processes, &config);
   updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
-  renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+  renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms, false);
 
   while (true) {
     const int ch = getch();
