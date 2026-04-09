@@ -223,19 +223,19 @@ std::optional<double> collectRxKbps(SystemPluginCtx* ctx) {
     if (!found) return std::nullopt;
 
     auto now = std::chrono::steady_clock::now();
-    if (!ctx->net_initialized) {
+    if (!ctx->rx_initialized) {
         ctx->prev_rx_bytes = rx_bytes;
-        ctx->prev_net_time = now;
-        ctx->net_initialized = true;
+        ctx->prev_rx_time = now;
+        ctx->rx_initialized = true;
         return 0.0;
     }
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->prev_net_time).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->prev_rx_time).count();
     if (elapsed <= 0) return 0.0;
 
     double delta = static_cast<double>(rx_bytes - ctx->prev_rx_bytes);
     ctx->prev_rx_bytes = rx_bytes;
-    ctx->prev_net_time = now;
+    ctx->prev_rx_time = now;
 
     return (delta / 1024.0) / (static_cast<double>(elapsed) / 1000.0);
 }
@@ -278,19 +278,19 @@ std::optional<double> collectTxKbps(SystemPluginCtx* ctx) {
     if (!found) return std::nullopt;
 
     auto now = std::chrono::steady_clock::now();
-    if (!ctx->net_initialized) {
+    if (!ctx->tx_initialized) {
         ctx->prev_tx_bytes = tx_bytes;
-        ctx->prev_net_time = now;
-        ctx->net_initialized = true;
+        ctx->prev_tx_time = now;
+        ctx->tx_initialized = true;
         return 0.0;
     }
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->prev_net_time).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->prev_tx_time).count();
     if (elapsed <= 0) return 0.0;
 
     double delta = static_cast<double>(tx_bytes - ctx->prev_tx_bytes);
     ctx->prev_tx_bytes = tx_bytes;
-    ctx->prev_net_time = now;
+    ctx->prev_tx_time = now;
 
     return (delta / 1024.0) / (static_cast<double>(elapsed) / 1000.0);
 }

@@ -1436,10 +1436,12 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
                    humanBytes(used));
   }
 
-  if (!snapshot.network.interface.empty()) {
-    drawZenSectionHeader(win, left_row++, left_x, left_w, "Network", 6);
-    left_row++;
-    char net_buf[128];
+  drawZenSectionHeader(win, left_row++, left_x, left_w, "Network", 6);
+  left_row++;
+  char net_buf[128];
+  if (snapshot.network.interface.empty()) {
+    addClippedText(win, left_row++, left_x + 1, left_w - 2, "N/A");
+  } else {
     std::snprintf(net_buf, sizeof(net_buf), "Interface: %s", snapshot.network.interface.c_str());
     addClippedText(win, left_row++, left_x + 1, left_w - 2, net_buf);
     if (snapshot.network.rx_kbps) {
@@ -1450,8 +1452,8 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
       std::string tx_line = "TX: " + formatOptional(snapshot.network.tx_kbps, " KB/s", 1);
       addClippedText(win, left_row++, left_x + 1, left_w - 2, tx_line);
     }
-    left_row++;
   }
+  left_row++;
 
   if (!snapshot.docker_containers.empty()) {
     bool focused = (config.zen_focus == ZenFocus::kDocker);

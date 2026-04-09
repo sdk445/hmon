@@ -13,8 +13,10 @@ struct SystemPluginCtx {
 
     unsigned long long prev_rx_bytes = 0;
     unsigned long long prev_tx_bytes = 0;
-    bool net_initialized = false;
-    std::chrono::steady_clock::time_point prev_net_time;
+    bool rx_initialized = false;
+    bool tx_initialized = false;
+    std::chrono::steady_clock::time_point prev_rx_time;
+    std::chrono::steady_clock::time_point prev_tx_time;
     std::string active_interface;
 
 
