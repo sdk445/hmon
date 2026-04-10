@@ -59,7 +59,7 @@ Dense two-column layout with kernel stats, per-core CPU cycles, detailed memory 
 | Dependency | Version |
 |---|---|
 | Linux | any |
-| C++ compiler | C++17 (`g++` or `clang++`) |
+| C++ compiler | C++20 (`g++` or `clang++`) |
 | CMake | 3.16+ |
 | ncurses | dev package |
 
