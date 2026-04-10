@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -20,35 +21,6 @@
 namespace fs = std::filesystem;
 
 namespace {
-
-std::string trim(const std::string& s) {
-    auto b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    auto e = s.find_last_not_of(" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
-
-std::optional<unsigned long long> readULL(const fs::path& p) {
-    std::ifstream f(p);
-    if (!f) return std::nullopt;
-    unsigned long long v;
-    if (f >> v) return v;
-    return std::nullopt;
-}
-
-std::optional<std::string> readFirstLine(const fs::path& p) {
-    std::ifstream f(p);
-    if (!f) return std::nullopt;
-    std::string line;
-    if (std::getline(f, line)) return trim(line);
-    return std::nullopt;
-}
-
-bool isCpuDir(const std::string& name) {
-    if (name.size() <= 3 || name.rfind("cpu", 0) != 0) return false;
-    return std::all_of(name.begin() + 3, name.end(),
-                       [](unsigned char c) { return std::isdigit(c) != 0; });
-}
 
 }
 
@@ -87,14 +59,14 @@ std::optional<double> getSwapUsagePercent() {
     if (!f) return std::nullopt;
     std::string line;
     long long total = 0, free = 0;
-    bool has_total = false, has_free = false;
+    bool has_total = false;
     while (std::getline(f, line)) {
         if (line.rfind("SwapTotal:", 0) == 0) {
             std::istringstream iss(line.substr(10));
             if (iss >> total) has_total = true;
         } else if (line.rfind("SwapFree:", 0) == 0) {
             std::istringstream iss(line.substr(9));
-            if (iss >> free) has_free = true;
+            (void)(iss >> free);
         }
     }
     if (!has_total || total <= 0) return std::nullopt;
@@ -293,6 +265,193 @@ std::optional<double> collectTxKbps(SystemPluginCtx* ctx) {
     ctx->prev_tx_time = now;
 
     return (delta / 1024.0) / (static_cast<double>(elapsed) / 1000.0);
+}
+
+std::vector<DiskIoSample> parseDiskStats() {
+    std::vector<DiskIoSample> result;
+    std::ifstream f("/proc/diskstats");
+    if (!f) return result;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        unsigned int major, minor;
+        std::string name;
+        uint64_t rd_ios, rd_merges, rd_sectors, rd_ms;
+        uint64_t wr_ios, wr_merges, wr_sectors, wr_ms;
+        uint64_t io_in_progress, io_ms, weighted_io_ms;
+
+        if (!(iss >> major >> minor >> name >> rd_ios >> rd_merges >> rd_sectors >> rd_ms
+                    >> wr_ios >> wr_merges >> wr_sectors >> wr_ms
+                    >> io_in_progress >> io_ms >> weighted_io_ms)) {
+            continue;
+        }
+
+        DiskIoSample sample;
+        sample.name = name;
+        sample.sectors_read = rd_sectors;
+        sample.sectors_written = wr_sectors;
+        sample.read_ops = rd_ios;
+        sample.write_ops = wr_ios;
+        sample.io_ticks_ms = io_ms;
+        result.push_back(std::move(sample));
+    }
+    return result;
+}
+
+std::vector<DiskIoSample> collectDiskIoDelta(SystemPluginCtx* ctx) {
+    auto samples = parseDiskStats();
+    auto now = std::chrono::steady_clock::now();
+
+    if (!ctx->disk_io_initialized) {
+        ctx->prev_disk_samples = samples;
+        ctx->prev_disk_io_time = now;
+        ctx->disk_io_initialized = true;
+        return {};
+    }
+
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - ctx->prev_disk_io_time).count();
+    if (elapsed_ms <= 0) return {};
+    const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
+
+    std::vector<DiskIoSample> deltas;
+    for (auto& cur : samples) {
+        for (auto& prev : ctx->prev_disk_samples) {
+            if (cur.name != prev.name) continue;
+
+            double read_kb = static_cast<double>(cur.sectors_read - prev.sectors_read) * 512.0 / 1024.0;
+            double write_kb = static_cast<double>(cur.sectors_written - prev.sectors_written) * 512.0 / 1024.0;
+            uint64_t busy_ticks = cur.io_ticks_ms - prev.io_ticks_ms;
+            double busy_pct = std::min(100.0, (static_cast<double>(busy_ticks) / elapsed_ms) * 100.0);
+            double read_kbps = read_kb / elapsed_sec;
+            double write_kbps = write_kb / elapsed_sec;
+
+            DiskIoSample delta;
+            delta.name = cur.name;
+            delta.sectors_read = cur.sectors_read - prev.sectors_read;
+            delta.sectors_written = cur.sectors_written - prev.sectors_written;
+            delta.io_ticks_ms = busy_ticks;
+            delta.read_ops = cur.read_ops - prev.read_ops;
+            delta.write_ops = cur.write_ops - prev.write_ops;
+            delta.read_kbps = read_kbps;
+            delta.write_kbps = write_kbps;
+            delta.busy_percent = busy_pct;
+            deltas.push_back(std::move(delta));
+            break;
+        }
+    }
+
+    ctx->prev_disk_samples = std::move(samples);
+    ctx->prev_disk_io_time = now;
+    return deltas;
+}
+
+NetConnStats collectNetConnStats() {
+    NetConnStats result;
+    static const std::vector<std::string> paths = {
+        "/proc/net/tcp", "/proc/net/tcp6"
+    };
+
+    for (const auto& path : paths) {
+        std::ifstream f(path);
+        if (!f) continue;
+        std::string line;
+        std::getline(f, line);
+        while (std::getline(f, line)) {
+            std::istringstream iss(line);
+            std::string slot, local, remote, state_str;
+            if (!(iss >> slot >> local >> remote >> state_str)) continue;
+            unsigned long state = std::stoul(state_str, nullptr, 16);
+            switch (state) {
+                case 0x01: ++result.established; break;
+                case 0x02: ++result.syn_sent; break;
+                case 0x03: ++result.syn_recv; break;
+                case 0x04: ++result.fin_wait1; break;
+                case 0x05: ++result.fin_wait2; break;
+                case 0x06: ++result.time_wait; break;
+                case 0x07: ++result.close; break;
+                case 0x08: ++result.close_wait; break;
+                case 0x09: ++result.last_ack; break;
+                case 0x0A: ++result.listen; break;
+                case 0x0B: ++result.closing; break;
+            }
+        }
+    }
+    return result;
+}
+
+MemInfoDetailed collectMemInfoDetailed() {
+    MemInfoDetailed result;
+    std::ifstream f("/proc/meminfo");
+    if (!f) return result;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string key;
+        long long val;
+        std::string unit;
+        if (iss >> key >> val) {
+            key.pop_back();
+            if (key == "Buffers") result.buffers_kb = val;
+            else if (key == "Cached") result.cached_kb = val;
+            else if (key == "Shmem") result.shared_kb = val;
+            else if (key == "SReclaimable") result.sreclaimable_kb = val;
+            else if (key == "Slab") result.slab_kb = val;
+            else if (key == "Active") result.active_kb = val;
+            else if (key == "Inactive") result.inactive_kb = val;
+            else if (key == "Dirty") result.dirty_kb = val;
+            else if (key == "Writeback") result.writeback_kb = val;
+            else if (key == "HugePages_Total") result.hugepages_total_kb = val;
+            else if (key == "Mapped") result.mapped_kb = val;
+            else if (key == "PageTables") result.page_tables_kb = val;
+            else if (key == "NFS_Unstable") result.nfs_unstable_kb = val;
+            else if (key == "Bounce") result.bounce_kb = val;
+        }
+    }
+    return result;
+}
+
+SystemStats collectSystemStats() {
+    SystemStats result;
+
+    std::ifstream la("/proc/loadavg");
+    if (la) {
+        la >> result.load_avg_1 >> result.load_avg_5 >> result.load_avg_15
+           >> result.procs_running >> result.procs_blocked;
+    }
+
+    std::ifstream up("/proc/uptime");
+    if (up) {
+        double uptime_f;
+        if (up >> uptime_f) result.uptime_seconds = static_cast<int64_t>(uptime_f);
+    }
+
+    std::ifstream stat("/proc/stat");
+    if (stat) {
+        std::string line;
+        while (std::getline(stat, line)) {
+            std::istringstream iss(line);
+            std::string key;
+            if (!(iss >> key)) continue;
+            if (key == "ctxt") { iss >> result.context_switches; }
+            else if (key == "intr") {
+                iss >> result.interrupts;
+            }
+            else if (key == "softirq") {
+                iss >> result.softirqs;
+            }
+            else if (key == "processes") { iss >> result.forks; }
+        }
+    }
+
+    std::ifstream fnr("/proc/sys/fs/file-nr");
+    if (fnr) {
+        fnr >> result.fd_open >> result.fd_max;
+    }
+
+    return result;
 }
 
 std::string currentTimestamp() {

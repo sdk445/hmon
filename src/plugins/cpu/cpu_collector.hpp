@@ -31,6 +31,7 @@ struct CpuPluginCtx {
         bool initialized = false;
     };
     std::vector<CoreState> core_states;
+    std::vector<CoreState> core_cycle_states;
 };
 
 std::string collectName();
@@ -40,5 +41,17 @@ std::optional<double> collectTemperature();
 std::optional<double> collectFrequency();
 std::optional<double> collectUsagePercent(CpuPluginCtx* ctx);
 std::vector<double> collectPerCoreUsagePercent(CpuPluginCtx* ctx);
+
+struct CoreCycles {
+  double user_pct = 0;
+  double nice_pct = 0;
+  double system_pct = 0;
+  double idle_pct = 0;
+  double iowait_pct = 0;
+  double irq_pct = 0;
+  double softirq_pct = 0;
+  double steal_pct = 0;
+};
+std::vector<CoreCycles> collectPerCoreCycles(CpuPluginCtx* ctx);
 
 }

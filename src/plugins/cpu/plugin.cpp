@@ -29,7 +29,7 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
         list->capacity = new_cap;
     }
     auto* item = &list->items[list->count];
-    item->key = key;
+    item->key = strdup(key ? key : "");
     item->value.type = type;
     switch (type) {
     case HMON_VAL_STRING: {
@@ -83,8 +83,35 @@ static int cpu_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) 
         char key[64];
         std::snprintf(key, sizeof(key), "%s.%zu", HMON_METRIC_CPU_CORE_USAGE_PCT, i);
         double val = per_core[i];
-        appendMetric(out_list, strdup(key), HMON_VAL_DOUBLE, &val);
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &val);
     }
+
+    auto per_core_cycles = hmon::plugins::cpu::collectPerCoreCycles(&c->collector);
+    for (size_t i = 0; i < per_core_cycles.size(); ++i) {
+        char key[64];
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.user", i);
+        double v = per_core_cycles[i].user_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.system", i);
+        v = per_core_cycles[i].system_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.idle", i);
+        v = per_core_cycles[i].idle_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.iowait", i);
+        v = per_core_cycles[i].iowait_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.irq", i);
+        v = per_core_cycles[i].irq_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.softirq", i);
+        v = per_core_cycles[i].softirq_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+        std::snprintf(key, sizeof(key), "cpu.core_cycles.%zu.steal", i);
+        v = per_core_cycles[i].steal_pct;
+        appendMetric(out_list, key, HMON_VAL_DOUBLE, &v);
+    }
+
     return 0;
 }
 
@@ -96,9 +123,8 @@ static void cpu_plugin_destroy(hmon_plugin_ctx* ctx) {
 static void cpu_plugin_free_list(hmon_metric_list* list) {
     if (!list) return;
     for (size_t i = 0; i < list->count; ++i) {
+        free(const_cast<char*>(list->items[i].key));
         if (list->items[i].value.type == HMON_VAL_STRING && list->items[i].value.v.str) {
-            if (std::strncmp(list->items[i].key, "cpu.core_usage_pct", 18) == 0)
-                free(const_cast<char*>(list->items[i].key));
             free(const_cast<char*>(list->items[i].value.v.str));
         }
     }
