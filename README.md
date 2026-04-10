@@ -46,6 +46,7 @@ Consolidated single-screen view with Docker, ports, services, databases, cron, a
 ### Pro Mode
 
 <!-- TODO: Add pro mode screenshot -->
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c4abbf21-cfc0-49c3-bac0-3f21450b322e" />
 
 Dense two-column layout with kernel stats, per-core CPU cycles, detailed memory breakdown, file descriptors, GPU, network connections, disk I/O, Docker containers, and listening ports. Full-width process table at the bottom. Toggle with `P`.
 
@@ -169,11 +170,13 @@ cmake --build build -j
 ```
 
 ---
-
 <p align="center">
+  <a href="https://github.com/sponsors/sdk445">
+    <img src="https://img.shields.io/badge/Sponsor-❤️-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors" />
+  </a>
+  &nbsp;&nbsp;
   <a href="https://buymeacoffee.com/sdk445">
     <img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=sdk445&button_colour=FFDD00&font_colour=000000&font_family=Lato&outline_colour=000000&coffee_colour=ffffff" alt="Buy Me a Coffee" />
   </a>
 </p>
-
 <p align="center">MIT License © 2026 Chinmoy</p>
