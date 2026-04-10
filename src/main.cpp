@@ -13,6 +13,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <limits>
 #include <optional>
@@ -121,6 +122,7 @@ struct Config {
   bool show_gpu = true;
   bool show_history = true;
   bool zen_mode = false;
+  bool pro_mode = false;
   int lock_pid = -1;
   int selected_pid = -1;
   SortMode sort_mode = SortMode::kCpu;
@@ -430,6 +432,59 @@ int colorPairForPercent(double percent) {
   return 1;
 }
 
+const char* sortModeLabel(SortMode mode) {
+  switch (mode) {
+    case SortMode::kCpu:
+      return "CPU";
+    case SortMode::kMem:
+      return "MEM";
+    case SortMode::kGpu:
+      return "GPU";
+    case SortMode::kPid:
+      return "PID";
+  }
+  return "CPU";
+}
+
+int colorPairForState(double value, double warn_threshold, double critical_threshold) {
+  if (value >= critical_threshold) {
+    return 3;
+  }
+  if (value >= warn_threshold) {
+    return 2;
+  }
+  return 1;
+}
+
+std::string statusWord(double value, double warn_threshold, double critical_threshold,
+                       const char* ok, const char* warn, const char* critical) {
+  if (value >= critical_threshold) {
+    return critical;
+  }
+  if (value >= warn_threshold) {
+    return warn;
+  }
+  return ok;
+}
+
+void addStatusBadge(WINDOW* win, int row, int col, const std::string& label, int color_pair) {
+  if (!win || label.empty()) {
+    return;
+  }
+  if (has_colors()) {
+    wattron(win, COLOR_PAIR(color_pair));
+  }
+  wattron(win, A_BOLD);
+  mvwaddch(win, row, col++, '[');
+  mvwaddnstr(win, row, col, label.c_str(), static_cast<int>(label.size()));
+  col += static_cast<int>(label.size());
+  mvwaddch(win, row, col, ']');
+  wattroff(win, A_BOLD);
+  if (has_colors()) {
+    wattroff(win, COLOR_PAIR(color_pair));
+  }
+}
+
 void addWindowLine(WINDOW* win, int row, const std::string& text) {
   if (!win) {
     return;
@@ -485,6 +540,55 @@ void drawMiniBar(WINDOW* win, int row, int col, double percent, int width) {
   if (has_colors()) {
     wattroff(win, COLOR_PAIR(color));
   }
+}
+
+void drawStackedBar(WINDOW* win, int row, int col, int width,
+                    double first_pct, int first_color,
+                    double second_pct, int second_color,
+                    double third_pct, int third_color) {
+  if (!win || width < 1) {
+    return;
+  }
+
+  const double a = std::max(0.0, first_pct);
+  const double b = std::max(0.0, second_pct);
+  const double c = std::max(0.0, third_pct);
+  const double total = std::max(0.0, std::min(100.0, a + b + c));
+
+  int first_w = static_cast<int>(std::round((a / 100.0) * width));
+  int second_w = static_cast<int>(std::round((b / 100.0) * width));
+  int third_w = static_cast<int>(std::round((c / 100.0) * width));
+  if (first_w + second_w + third_w > width) {
+    const int overflow = first_w + second_w + third_w - width;
+    third_w = std::max(0, third_w - overflow);
+  }
+  int used = 0;
+  auto paint = [&](int count, int color) {
+    if (count <= 0) {
+      return;
+    }
+    if (has_colors()) {
+      wattron(win, COLOR_PAIR(color));
+    }
+    wattron(win, A_BOLD);
+    for (int i = 0; i < count && used < width; ++i, ++used) {
+      mvwaddch(win, row, col + used, ACS_CKBOARD);
+    }
+    wattroff(win, A_BOLD);
+    if (has_colors()) {
+      wattroff(win, COLOR_PAIR(color));
+    }
+  };
+
+  paint(first_w, first_color);
+  paint(second_w, second_color);
+  paint(third_w, third_color);
+
+  while (used < width) {
+    mvwaddch(win, row, col + used, ' ');
+    ++used;
+  }
+  (void)total;
 }
 
 void drawBar(WINDOW* win, int row, const std::string& label, double percent, int type = 0) {
@@ -1436,10 +1540,12 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
                    humanBytes(used));
   }
 
-  if (!snapshot.network.interface.empty()) {
-    drawZenSectionHeader(win, left_row++, left_x, left_w, "Network", 6);
-    left_row++;
-    char net_buf[128];
+  drawZenSectionHeader(win, left_row++, left_x, left_w, "Network", 6);
+  left_row++;
+  char net_buf[128];
+  if (snapshot.network.interface.empty()) {
+    addClippedText(win, left_row++, left_x + 1, left_w - 2, "N/A");
+  } else {
     std::snprintf(net_buf, sizeof(net_buf), "Interface: %s", snapshot.network.interface.c_str());
     addClippedText(win, left_row++, left_x + 1, left_w - 2, net_buf);
     if (snapshot.network.rx_kbps) {
@@ -1450,8 +1556,8 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
       std::string tx_line = "TX: " + formatOptional(snapshot.network.tx_kbps, " KB/s", 1);
       addClippedText(win, left_row++, left_x + 1, left_w - 2, tx_line);
     }
-    left_row++;
   }
+  left_row++;
 
   if (!snapshot.docker_containers.empty()) {
     bool focused = (config.zen_focus == ZenFocus::kDocker);
@@ -1757,6 +1863,506 @@ void renderZenMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
   wnoutrefresh(win);
 }
 
+void renderProMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
+                   const std::vector<ProcessInfo>& processes, bool loading = false) {
+  if (!win) return;
+
+  int max_y, max_x;
+  getmaxyx(win, max_y, max_x);
+
+  erase();
+
+  const int margin = std::max(2, max_x / 50);
+  const int content_w = std::max(20, max_x - margin * 2);
+  int row = 0;
+
+  /* Compact top bar: host + time + sort info */
+  {
+    std::string left_info = " hmon " + std::string(version::kCurrent) + "  " + hostName();
+    std::string right_info = currentTimestamp() + "  Sort:" + sortModeLabel(config.sort_mode);
+    if (has_colors()) attron(COLOR_PAIR(4) | A_REVERSE);
+    attron(A_BOLD);
+    for (int x = 0; x < max_x; ++x) mvaddch(row, x, ' ');
+    mvaddnstr(row, 1, left_info.c_str(), max_x / 2);
+    mvaddnstr(row, std::max(0, max_x - static_cast<int>(right_info.size()) - 1),
+              right_info.c_str(), static_cast<int>(right_info.size()));
+    attroff(A_BOLD);
+    if (has_colors()) attroff(COLOR_PAIR(4) | A_REVERSE);
+    row++;
+  }
+
+  if (loading) {
+    attron(A_BOLD);
+    mvaddnstr(row + 1, margin, "Collecting metrics...", max_x - margin * 2);
+    attroff(A_BOLD);
+    wnoutrefresh(win);
+    return;
+  }
+
+  row++;
+
+  const int col_gap = std::max(2, content_w / 40);
+  const int col_w = (content_w - col_gap) / 2;
+  const int col_x[2] = {margin, margin + col_w + col_gap};
+  int cur[2] = {row, row};
+
+  auto fmtKb = [&](long long kb) -> std::string {
+    if (kb <= 0) return "0 B";
+    return humanBytes(static_cast<unsigned long long>(kb) * 1024ULL);
+  };
+
+  auto fmtUptime = [&](int64_t secs) -> std::string {
+    int64_t d = secs / 86400;
+    int h = (secs % 86400) / 3600;
+    int m = (secs % 3600) / 60;
+    char buf[32];
+    if (d > 0) std::snprintf(buf, sizeof(buf), "%ldd %dh %dm", d, h, m);
+    else std::snprintf(buf, sizeof(buf), "%dh %dm", h, m);
+    return buf;
+  };
+
+  auto fmtCount = [&](uint64_t v) -> std::string {
+    if (v >= 1000000000ULL) { char b[32]; std::snprintf(b, sizeof(b), "%.1fB", static_cast<double>(v) / 1e9); return b; }
+    if (v >= 1000000ULL) { char b[32]; std::snprintf(b, sizeof(b), "%.1fM", static_cast<double>(v) / 1e6); return b; }
+    if (v >= 1000ULL) { char b[32]; std::snprintf(b, sizeof(b), "%.1fK", static_cast<double>(v) / 1e3); return b; }
+    return std::to_string(v);
+  };
+
+  auto fmtRate = [&](double kbps) -> std::string {
+    if (kbps <= 0.0) return "0 B/s";
+    return humanBytes(static_cast<unsigned long long>(kbps * 1024.0)) + "/s";
+  };
+
+  auto fmtShortPercent = [&](double value) -> std::string {
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%3.0f%%", std::max(0.0, std::min(100.0, value)));
+    return buf;
+  };
+
+  auto addRow = [&](int c, const std::string& text, int col_pair = 1) {
+    int r = cur[c]++;
+    if (r >= max_y - 2) return;
+    if (has_colors()) wattron(win, COLOR_PAIR(col_pair));
+    addClippedText(win, r, col_x[c] + 1, col_w - 2, text);
+    if (has_colors()) wattroff(win, COLOR_PAIR(col_pair));
+  };
+
+  auto addSection = [&](int c, const std::string& title, int col_pair = 4) {
+    int r = cur[c];
+    if (r >= max_y - 2) return;
+    const int title_w = static_cast<int>(title.size());
+    const int line_w = std::max(0, col_w - title_w - 1);
+    wattron(win, A_BOLD);
+    if (has_colors()) wattron(win, COLOR_PAIR(col_pair));
+    addClippedText(win, r, col_x[c], col_w, title);
+    if (has_colors()) wattroff(win, COLOR_PAIR(col_pair));
+    wattroff(win, A_BOLD);
+    if (line_w > 0) {
+      if (has_colors()) wattron(win, COLOR_PAIR(7));
+      mvwhline(win, r, col_x[c] + title_w + 1, ACS_HLINE, line_w);
+      if (has_colors()) wattroff(win, COLOR_PAIR(7));
+    }
+    cur[c] = r + 1;
+  };
+
+  auto addLabelValueRow = [&](int c, const std::string& label, const std::string& value,
+                              int value_color = 1) {
+    int r = cur[c]++;
+    if (r >= max_y - 2) return;
+    const int label_w = std::min(14, std::max(8, col_w / 3));
+    addClippedText(win, r, col_x[c] + 1, label_w, label);
+    if (has_colors()) wattron(win, COLOR_PAIR(value_color));
+    addClippedText(win, r, col_x[c] + 1 + label_w, col_w - 3 - label_w, value);
+    if (has_colors()) wattroff(win, COLOR_PAIR(value_color));
+  };
+
+  auto addMeterRow = [&](int c, const std::string& label, double pct, const std::string& detail,
+                         double warn_threshold, double critical_threshold) {
+    int r = cur[c]++;
+    if (r >= max_y - 2) return;
+    const int label_w = 8;
+    const int pct_w = 6;
+    const int bar_w = std::max(8, std::min(16, col_w / 3));
+    addClippedText(win, r, col_x[c] + 1, label_w, label);
+    drawMiniBar(win, r, col_x[c] + 1 + label_w, pct, bar_w);
+    if (has_colors()) wattron(win, COLOR_PAIR(colorPairForState(pct, warn_threshold, critical_threshold)));
+    addClippedText(win, r, col_x[c] + 2 + label_w + bar_w, pct_w, fmtShortPercent(pct));
+    if (has_colors()) wattroff(win, COLOR_PAIR(colorPairForState(pct, warn_threshold, critical_threshold)));
+    if (!detail.empty()) {
+      addClippedText(win, r, col_x[c] + 3 + label_w + bar_w + pct_w,
+                     std::max(0, col_w - (label_w + bar_w + pct_w + 6)), detail);
+    }
+  };
+
+  auto addTableHeader = [&](int c, const std::string& text) {
+    int r = cur[c]++;
+    if (r >= max_y - 2) return;
+    wattron(win, A_BOLD);
+    addClippedText(win, r, col_x[c] + 1, col_w - 2, text);
+    wattroff(win, A_BOLD);
+  };
+
+  /* ========== LEFT COLUMN ========== */
+
+  addSection(0, "SYSTEM");
+
+  if (snapshot.sys_stats.uptime_seconds > 0)
+    addLabelValueRow(0, "Uptime", fmtUptime(snapshot.sys_stats.uptime_seconds));
+
+  char load_buf[48];
+  std::snprintf(load_buf, sizeof(load_buf), "%.2f / %.2f / %.2f",
+                snapshot.sys_stats.load_avg_1, snapshot.sys_stats.load_avg_5, snapshot.sys_stats.load_avg_15);
+  addLabelValueRow(0, "Load", load_buf);
+
+  if (snapshot.cpu.frequency_mhz) {
+    char fb[32];
+    double v = *snapshot.cpu.frequency_mhz;
+    if (v >= 1000.0) std::snprintf(fb, sizeof(fb), "%.2f GHz", v / 1000.0);
+    else std::snprintf(fb, sizeof(fb), "%.0f MHz", v);
+    addLabelValueRow(0, "Freq", fb);
+  }
+
+  cur[0]++;
+
+  addSection(0, "CPU");
+
+  if (snapshot.cpu.usage_percent) {
+    addMeterRow(0, "Usage", *snapshot.cpu.usage_percent, "", 65.0, 85.0);
+  }
+
+  if (snapshot.cpu.temperature_c) {
+    char tb[16];
+    std::snprintf(tb, sizeof(tb), "%.1f\xc2\xb0""C", *snapshot.cpu.temperature_c);
+    int cp = (*snapshot.cpu.temperature_c > 80) ? 3 : (*snapshot.cpu.temperature_c > 60) ? 2 : 1;
+    addLabelValueRow(0, "Temp", tb, cp);
+  }
+
+  cur[0]++;
+
+  /* Per-core breakdown — only when data exists */
+  if (!snapshot.cpu.core_user_pct.empty()) {
+    addSection(0, "CORES");
+
+    const size_t num_cores = std::max(
+        snapshot.cpu.core_user_pct.size(),
+        std::max(snapshot.cpu.core_system_pct.size(),
+                 std::max(snapshot.cpu.core_iowait_pct.size(), snapshot.cpu.core_idle_pct.size())));
+    const int bar_w = std::max(10, std::min(18, col_w - 26));
+
+    addTableHeader(0, "Core  Act   Usr  Sys Wait");
+
+    for (size_t i = 0; i < num_cores; ++i) {
+      int r = cur[0];
+      if (r >= max_y - 2) break;
+      const int idx = static_cast<int>(i);
+      const double user = idx < static_cast<int>(snapshot.cpu.core_user_pct.size()) ? snapshot.cpu.core_user_pct[idx] : 0.0;
+      const double sys = idx < static_cast<int>(snapshot.cpu.core_system_pct.size()) ? snapshot.cpu.core_system_pct[idx] : 0.0;
+      const double iowait = idx < static_cast<int>(snapshot.cpu.core_iowait_pct.size()) ? snapshot.cpu.core_iowait_pct[idx] : 0.0;
+      const double idle = idx < static_cast<int>(snapshot.cpu.core_idle_pct.size()) ? snapshot.cpu.core_idle_pct[idx] : 100.0;
+      const double active = std::max(0.0, 100.0 - idle);
+
+      char label[8];
+      std::snprintf(label, sizeof(label), "C%02d", idx);
+      if (has_colors()) wattron(win, COLOR_PAIR(colorPairForPercent(active)));
+      wattron(win, A_BOLD);
+      addClippedText(win, r, col_x[0] + 1, 4, label);
+      wattroff(win, A_BOLD);
+      if (has_colors()) wattroff(win, COLOR_PAIR(colorPairForPercent(active)));
+
+      addClippedText(win, r, col_x[0] + 7, 5, fmtShortPercent(active));
+      addClippedText(win, r, col_x[0] + 13, 4, fmtShortPercent(user));
+      addClippedText(win, r, col_x[0] + 18, 4, fmtShortPercent(sys));
+      addClippedText(win, r, col_x[0] + 23, 4, fmtShortPercent(iowait));
+      drawStackedBar(win, r, col_x[0] + 29, bar_w, user, 1, sys, 3, iowait, 5);
+      cur[0] = r + 1;
+    }
+
+    cur[0]++;
+  }
+
+  /* Kernel stats */
+  addSection(0, "KERNEL");
+
+  addLabelValueRow(0, "Ctx Switch", fmtCount(snapshot.sys_stats.context_switches));
+  addLabelValueRow(0, "Interrupts", fmtCount(snapshot.sys_stats.interrupts));
+  addLabelValueRow(0, "Softirqs", fmtCount(snapshot.sys_stats.softirqs));
+  addLabelValueRow(0, "Forks", fmtCount(snapshot.sys_stats.forks));
+
+  cur[0]++;
+
+  addSection(0, "MEMORY");
+
+  if (snapshot.ram.total_kb && snapshot.ram.available_kb) {
+    long long total = *snapshot.ram.total_kb;
+    long long avail = std::max(0LL, *snapshot.ram.available_kb);
+    long long used = std::max(0LL, total - avail);
+    double pct = total > 0 ? (100.0 * used / total) : 0.0;
+
+    addLabelValueRow(0, "Total", fmtKb(total));
+    addMeterRow(0, "Used", pct, fmtKb(used), 70.0, 90.0);
+    addLabelValueRow(0, "Avail", fmtKb(avail));
+  }
+
+  auto addMemRow = [&](const char* label, std::optional<long long> v) {
+    if (!v || *v <= 0) return;
+    addLabelValueRow(0, label, fmtKb(*v));
+  };
+
+  addMemRow("Buffers", snapshot.mem_detailed.buffers_kb);
+  addMemRow("Cached", snapshot.mem_detailed.cached_kb);
+  addMemRow("Shared", snapshot.mem_detailed.shared_kb);
+  addMemRow("Slab", snapshot.mem_detailed.slab_kb);
+  addMemRow("Reclaimable", snapshot.mem_detailed.sreclaimable_kb);
+  addMemRow("Active", snapshot.mem_detailed.active_kb);
+  addMemRow("Inactive", snapshot.mem_detailed.inactive_kb);
+  addMemRow("Mapped", snapshot.mem_detailed.mapped_kb);
+  addMemRow("Dirty", snapshot.mem_detailed.dirty_kb);
+  addMemRow("PageTables", snapshot.mem_detailed.page_tables_kb);
+  addMemRow("HugePages", snapshot.mem_detailed.hugepages_total_kb);
+
+  /* ========== RIGHT COLUMN ========== */
+
+  /* GPU — show if data exists */
+  if (config.show_gpu && !snapshot.gpus.empty() && anyGpuHasTelemetry(snapshot.gpus)) {
+    addSection(1, "GPU");
+    const auto& gpu = snapshot.gpus[pickDisplayGpuIndex(snapshot.gpus)];
+    if (!gpu.name.empty()) addLabelValueRow(1, "Device", gpu.name);
+    if (gpu.utilization_percent)
+      addMeterRow(1, "Usage", *gpu.utilization_percent, "", 65.0, 85.0);
+    if (gpu.temperature_c) {
+      char tb[16];
+      std::snprintf(tb, sizeof(tb), "%.0f\xc2\xb0""C", *gpu.temperature_c);
+      int cp = (*gpu.temperature_c > 80) ? 3 : (*gpu.temperature_c > 60) ? 2 : 1;
+      addLabelValueRow(1, "Temp", tb, cp);
+    }
+    if (gpu.memory_used_mib && gpu.memory_total_mib) {
+      addLabelValueRow(1, "VRAM", formatGpuVramUsage(gpu.memory_used_mib, gpu.memory_total_mib));
+    }
+    if (gpu.power_w) {
+      char pw[16];
+      std::snprintf(pw, sizeof(pw), "%.1f W", *gpu.power_w);
+      addLabelValueRow(1, "Power", pw);
+    }
+    if (gpu.core_clock_mhz) {
+      char ck[16];
+      std::snprintf(ck, sizeof(ck), "%.0f MHz", *gpu.core_clock_mhz);
+      addLabelValueRow(1, "Clock", ck);
+    }
+    cur[1]++;
+  }
+
+  /* File descriptors */
+  addSection(1, "FILE DESCRIPTORS");
+
+  if (snapshot.sys_stats.fd_max > 0 && snapshot.sys_stats.fd_max < 1000000000ULL) {
+    double fd_pct = 100.0 * snapshot.sys_stats.fd_open / snapshot.sys_stats.fd_max;
+    addLabelValueRow(1, "Open", fmtCount(snapshot.sys_stats.fd_open));
+    addLabelValueRow(1, "Limit", fmtCount(snapshot.sys_stats.fd_max));
+    addMeterRow(1, "Usage", fd_pct, "", 60.0, 85.0);
+  } else if (snapshot.sys_stats.fd_open > 0) {
+    addLabelValueRow(1, "Open", fmtCount(snapshot.sys_stats.fd_open));
+    addLabelValueRow(1, "Limit", "unlimited");
+  }
+
+  cur[1]++;
+
+  /* Network */
+  addSection(1, "NETWORK");
+
+  int total_conns = snapshot.net_conn.established + snapshot.net_conn.syn_sent +
+                    snapshot.net_conn.syn_recv + snapshot.net_conn.fin_wait1 +
+                    snapshot.net_conn.fin_wait2 + snapshot.net_conn.time_wait +
+                    snapshot.net_conn.close + snapshot.net_conn.close_wait +
+                    snapshot.net_conn.last_ack + snapshot.net_conn.listen +
+                    snapshot.net_conn.closing;
+
+  addLabelValueRow(1, "Connections", std::to_string(total_conns));
+  if (snapshot.net_conn.established > 0)
+    addLabelValueRow(1, "Established", std::to_string(snapshot.net_conn.established));
+  if (snapshot.net_conn.listen > 0)
+    addLabelValueRow(1, "Listening", std::to_string(snapshot.net_conn.listen));
+  if (snapshot.net_conn.close_wait > 0)
+    addLabelValueRow(1, "Close Wait", std::to_string(snapshot.net_conn.close_wait), 2);
+
+  if (!snapshot.network.interface.empty()) {
+    addLabelValueRow(1, "Iface", snapshot.network.interface);
+    addLabelValueRow(1, "RX", snapshot.network.rx_kbps ? fmtRate(*snapshot.network.rx_kbps) : "0 B/s", 1);
+    addLabelValueRow(1, "TX", snapshot.network.tx_kbps ? fmtRate(*snapshot.network.tx_kbps) : "0 B/s", 3);
+  }
+
+  cur[1]++;
+
+  /* Disk I/O */
+  if (!snapshot.disk_io.devices.empty()) {
+    addSection(1, "DISK I/O");
+
+    auto disk_devices = snapshot.disk_io.devices;
+    std::sort(disk_devices.begin(), disk_devices.end(),
+              [](const DiskIoDevice& a, const DiskIoDevice& b) {
+                if (a.busy_percent != b.busy_percent) return a.busy_percent > b.busy_percent;
+                return (a.read_kbps + a.write_kbps) > (b.read_kbps + b.write_kbps);
+              });
+    int shown_disks = 0;
+    addTableHeader(1, "Device      Read        Write       Busy");
+    for (const auto& dev : disk_devices) {
+      if (dev.name.find("loop") == 0 || dev.name.find("ram") == 0) continue;
+      if (shown_disks >= 4) break;
+
+      char d1[128];
+      std::snprintf(d1, sizeof(d1), "%-10s %-11s %-11s %5.0f%%",
+                    dev.name.c_str(),
+                    fmtRate(dev.read_kbps).c_str(),
+                    fmtRate(dev.write_kbps).c_str(),
+                    dev.busy_percent);
+      addRow(1, d1, colorPairForState(dev.busy_percent, 50.0, 80.0));
+      ++shown_disks;
+    }
+
+    cur[1]++;
+  }
+
+  /* Disk space */
+  addSection(1, "DISK SPACE");
+
+  if (snapshot.disk.total_bytes && snapshot.disk.free_bytes) {
+    unsigned long long total = *snapshot.disk.total_bytes;
+    unsigned long long free = *snapshot.disk.free_bytes;
+    unsigned long long used = (total > free) ? (total - free) : 0;
+    double pct = total > 0 ? (100.0 * used / total) : 0.0;
+
+    addLabelValueRow(1, "Mount", snapshot.disk.mount_point);
+    addLabelValueRow(1, "Free", humanBytes(free));
+    addMeterRow(1, "Used", pct, humanBytes(used), 80.0, 92.0);
+  }
+
+  /* Swap */
+  if (snapshot.swap.total_kb && *snapshot.swap.total_kb > 0) {
+    cur[1]++;
+    addSection(1, "SWAP");
+
+    long long st = *snapshot.swap.total_kb;
+    long long sf = snapshot.swap.free_kb.value_or(st);
+    long long su = std::max(0LL, st - sf);
+    double sp = st > 0 ? (100.0 * su / st) : 0.0;
+
+    addLabelValueRow(1, "Total", fmtKb(st));
+    addMeterRow(1, "Used", sp, fmtKb(su), 30.0, 70.0);
+  }
+
+  /* Docker containers */
+  if (!snapshot.docker_containers.empty()) {
+    cur[1]++;
+    addSection(1, "DOCKER", 6);
+    addTableHeader(1, "Name               CPU%  MEM%  State");
+    int shown = 0;
+    for (const auto& ct : snapshot.docker_containers) {
+      if (shown >= 6 || cur[1] >= max_y - 2) break;
+      char line[128];
+      std::snprintf(line, sizeof(line), "%-18s %5.1f %5.1f  %s",
+                    ct.name.substr(0, 18).c_str(), ct.cpu_percent, ct.mem_percent,
+                    ct.state.c_str());
+      int cp = (ct.state == "running") ? 1 : 2;
+      addRow(1, line, cp);
+      ++shown;
+    }
+  }
+
+  /* Listening ports */
+  if (!snapshot.ports.empty()) {
+    cur[1]++;
+    addSection(1, "PORTS", 6);
+    int shown = 0;
+    for (const auto& p : snapshot.ports) {
+      if (shown >= 8 || cur[1] >= max_y - 2) break;
+      char line[128];
+      std::snprintf(line, sizeof(line), "%5u/%-4s %-6s %s",
+                    p.port, p.proto.c_str(), p.addr.c_str(),
+                    p.process.empty() ? "-" : p.process.c_str());
+      addRow(1, line);
+      ++shown;
+    }
+  }
+
+  /* Full-width process table below the two columns */
+  {
+    int proc_row = std::max(cur[0], cur[1]) + 1;
+    if (proc_row < max_y - 4 && !processes.empty()) {
+      const int proc_x = margin;
+      const int proc_w = content_w;
+
+      /* Section header */
+      {
+        std::string title = "PROCESSES";
+        int title_w = static_cast<int>(title.size());
+        int line_w = std::max(0, proc_w - title_w - 1);
+        wattron(win, A_BOLD);
+        if (has_colors()) wattron(win, COLOR_PAIR(4));
+        addClippedText(win, proc_row, proc_x, proc_w, title);
+        if (has_colors()) wattroff(win, COLOR_PAIR(4));
+        wattroff(win, A_BOLD);
+        if (line_w > 0) {
+          if (has_colors()) wattron(win, COLOR_PAIR(7));
+          mvwhline(win, proc_row, proc_x + title_w + 1, ACS_HLINE, line_w);
+          if (has_colors()) wattroff(win, COLOR_PAIR(7));
+        }
+        proc_row++;
+      }
+
+      /* Column header */
+      {
+        std::ostringstream hdr;
+        hdr << std::left << std::setw(8) << "PID" << " "
+            << std::setw(6) << "CPU%" << " "
+            << std::setw(6) << "MEM%" << " "
+            << "COMMAND";
+        wattron(win, A_BOLD);
+        addClippedText(win, proc_row, proc_x + 1, proc_w - 2, hdr.str());
+        wattroff(win, A_BOLD);
+        proc_row++;
+      }
+
+      int avail_rows = max_y - 2 - proc_row;
+      int show_count = std::min(static_cast<int>(processes.size()), std::max(1, avail_rows));
+      for (int i = 0; i < show_count && proc_row < max_y - 2; ++i) {
+        const auto& p = processes[static_cast<size_t>(i)];
+
+        bool highlighted = (config.lock_pid > 0 && p.pid == config.lock_pid) ||
+                           (config.show_selection_highlight && config.selected_pid > 0 && p.pid == config.selected_pid);
+
+        if (highlighted) {
+          if (has_colors()) wattron(win, A_REVERSE | COLOR_PAIR(5));
+          else wattron(win, A_REVERSE);
+        }
+
+        char pline[256];
+        std::snprintf(pline, sizeof(pline), "%-8d %5.1f  %5.1f  %s",
+                      p.pid, p.cpu_percent, p.mem_percent, p.command.c_str());
+        addClippedText(win, proc_row, proc_x + 1, proc_w - 2, pline);
+
+        if (highlighted) {
+          if (has_colors()) wattroff(win, A_REVERSE | COLOR_PAIR(5));
+          else wattroff(win, A_REVERSE);
+        }
+        proc_row++;
+      }
+    }
+  }
+
+  /* Bottom bar */
+  {
+    std::string shortcuts = " q:Quit  z:Zen  P:Pro  s:Sort  j/k:Nav  l:Lock  +/-:Speed  ?:Help ";
+    wattron(win, A_REVERSE);
+    mvwaddnstr(win, max_y - 1, 0, shortcuts.c_str(), max_x);
+    for (int x = static_cast<int>(shortcuts.size()); x < max_x; ++x)
+      mvwaddch(win, max_y - 1, x, ' ');
+    wattroff(win, A_REVERSE);
+  }
+
+  wnoutrefresh(win);
+}
+
+
+
 void drawHelpOverlay(WINDOW* overlay, const Config& config) {
   if (!overlay) return;
 
@@ -1789,6 +2395,7 @@ void drawHelpOverlay(WINDOW* overlay, const Config& config) {
   }
   mvwaddstr(overlay, row++, 4, "r       Refresh");
   mvwaddstr(overlay, row++, 4, "+/-     Speed");
+  mvwaddstr(overlay, row++, 4, "P       Pro mode (detailed metrics)");
   mvwaddstr(overlay, row++, 4, "Any key - Close help");
 
   wnoutrefresh(overlay);
@@ -1814,6 +2421,39 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   for (const auto& m : core_metrics) {
     if (m.value.type == HMON_VAL_DOUBLE) {
       snapshot.cpu.core_usage_percent.push_back(m.value.v.f64);
+    }
+  }
+
+  auto cycle_metrics = pm.get_by_prefix("cpu.core_cycles.");
+  if (!cycle_metrics.empty()) {
+    std::map<size_t, std::map<std::string, hmon::core::PluginManager::MetricEntry>> cycle_map;
+    for (const auto& m : cycle_metrics) {
+      auto d1 = m.key.rfind('.');
+      auto d2 = m.key.rfind('.', d1 - 1);
+      if (d1 == std::string::npos || d2 == std::string::npos) continue;
+      size_t idx = std::stoull(m.key.substr(d2 + 1, d1 - d2 - 1));
+      cycle_map[idx][m.key.substr(d1 + 1)] = m;
+    }
+    size_t n = cycle_map.size();
+    snapshot.cpu.core_user_pct.resize(n);
+    snapshot.cpu.core_system_pct.resize(n);
+    snapshot.cpu.core_idle_pct.resize(n);
+    snapshot.cpu.core_iowait_pct.resize(n);
+    snapshot.cpu.core_irq_pct.resize(n);
+    snapshot.cpu.core_softirq_pct.resize(n);
+    snapshot.cpu.core_steal_pct.resize(n);
+    for (const auto& [idx, vals] : cycle_map) {
+      auto get_d = [&](const std::string& k) {
+        auto it = vals.find(k);
+        return (it != vals.end() && it->second.value.type == HMON_VAL_DOUBLE) ? it->second.value.v.f64 : 0.0;
+      };
+      snapshot.cpu.core_user_pct[idx] = get_d("user");
+      snapshot.cpu.core_system_pct[idx] = get_d("system");
+      snapshot.cpu.core_idle_pct[idx] = get_d("idle");
+      snapshot.cpu.core_iowait_pct[idx] = get_d("iowait");
+      snapshot.cpu.core_irq_pct[idx] = get_d("irq");
+      snapshot.cpu.core_softirq_pct[idx] = get_d("softirq");
+      snapshot.cpu.core_steal_pct[idx] = get_d("steal");
     }
   }
 
@@ -1843,6 +2483,87 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   auto tx = pm.get_double(HMON_METRIC_NET_TX_KBPS);
   if (tx) snapshot.network.tx_kbps = *tx;
 
+  auto disk_io_metrics = pm.get_by_prefix("diskio.");
+  if (!disk_io_metrics.empty()) {
+    std::map<size_t, std::map<std::string, hmon::core::PluginManager::MetricEntry>> disk_io_map;
+    for (const auto& m : disk_io_metrics) {
+      auto dot1 = m.key.find('.');
+      auto dot2 = m.key.find('.', dot1 + 1);
+      if (dot1 == std::string::npos || dot2 == std::string::npos) continue;
+      size_t idx = std::stoull(m.key.substr(dot1 + 1, dot2 - dot1 - 1));
+      disk_io_map[idx][m.key.substr(dot2 + 1)] = m;
+    }
+    for (const auto& [idx, vals] : disk_io_map) {
+      DiskIoDevice dev;
+      auto it_name = vals.find("name");
+      if (it_name != vals.end() && it_name->second.value.type == HMON_VAL_STRING) {
+        dev.name = it_name->second.value.v.str;
+      }
+      auto it_rk = vals.find("read_kb");
+      if (it_rk != vals.end() && it_rk->second.value.type == HMON_VAL_DOUBLE) {
+        dev.read_kbps = it_rk->second.value.v.f64;
+      }
+      auto it_wk = vals.find("write_kb");
+      if (it_wk != vals.end() && it_wk->second.value.type == HMON_VAL_DOUBLE) {
+        dev.write_kbps = it_wk->second.value.v.f64;
+      }
+      auto it_bp = vals.find("busy_pct");
+      if (it_bp != vals.end() && it_bp->second.value.type == HMON_VAL_DOUBLE) {
+        dev.busy_percent = it_bp->second.value.v.f64;
+      }
+      auto it_ro = vals.find("read_ops");
+      if (it_ro != vals.end() && it_ro->second.value.type == HMON_VAL_INT64) {
+        dev.read_ops = static_cast<uint64_t>(it_ro->second.value.v.i64);
+      }
+      auto it_wo = vals.find("write_ops");
+      if (it_wo != vals.end() && it_wo->second.value.type == HMON_VAL_INT64) {
+        dev.write_ops = static_cast<uint64_t>(it_wo->second.value.v.i64);
+      }
+      if (!dev.name.empty()) {
+        snapshot.disk_io.devices.push_back(std::move(dev));
+      }
+    }
+  }
+
+  snapshot.net_conn.established = static_cast<int>(pm.get_int64("netconn.established").value_or(0));
+  snapshot.net_conn.syn_sent = static_cast<int>(pm.get_int64("netconn.syn_sent").value_or(0));
+  snapshot.net_conn.syn_recv = static_cast<int>(pm.get_int64("netconn.syn_recv").value_or(0));
+  snapshot.net_conn.fin_wait1 = static_cast<int>(pm.get_int64("netconn.fin_wait1").value_or(0));
+  snapshot.net_conn.fin_wait2 = static_cast<int>(pm.get_int64("netconn.fin_wait2").value_or(0));
+  snapshot.net_conn.time_wait = static_cast<int>(pm.get_int64("netconn.time_wait").value_or(0));
+  snapshot.net_conn.close = static_cast<int>(pm.get_int64("netconn.close").value_or(0));
+  snapshot.net_conn.close_wait = static_cast<int>(pm.get_int64("netconn.close_wait").value_or(0));
+  snapshot.net_conn.last_ack = static_cast<int>(pm.get_int64("netconn.last_ack").value_or(0));
+  snapshot.net_conn.listen = static_cast<int>(pm.get_int64("netconn.listen").value_or(0));
+  snapshot.net_conn.closing = static_cast<int>(pm.get_int64("netconn.closing").value_or(0));
+
+  if (auto v = pm.get_int64("meminfo.buffers_kb")) snapshot.mem_detailed.buffers_kb = *v;
+  if (auto v = pm.get_int64("meminfo.cached_kb")) snapshot.mem_detailed.cached_kb = *v;
+  if (auto v = pm.get_int64("meminfo.shared_kb")) snapshot.mem_detailed.shared_kb = *v;
+  if (auto v = pm.get_int64("meminfo.slab_kb")) snapshot.mem_detailed.slab_kb = *v;
+  if (auto v = pm.get_int64("meminfo.sreclaimable_kb")) snapshot.mem_detailed.sreclaimable_kb = *v;
+  if (auto v = pm.get_int64("meminfo.active_kb")) snapshot.mem_detailed.active_kb = *v;
+  if (auto v = pm.get_int64("meminfo.inactive_kb")) snapshot.mem_detailed.inactive_kb = *v;
+  if (auto v = pm.get_int64("meminfo.dirty_kb")) snapshot.mem_detailed.dirty_kb = *v;
+  if (auto v = pm.get_int64("meminfo.writeback_kb")) snapshot.mem_detailed.writeback_kb = *v;
+  if (auto v = pm.get_int64("meminfo.hugepages_total_kb")) snapshot.mem_detailed.hugepages_total_kb = *v;
+  if (auto v = pm.get_int64("meminfo.mapped_kb")) snapshot.mem_detailed.mapped_kb = *v;
+  if (auto v = pm.get_int64("meminfo.page_tables_kb")) snapshot.mem_detailed.page_tables_kb = *v;
+  if (auto v = pm.get_int64("meminfo.nfs_unstable_kb")) snapshot.mem_detailed.nfs_unstable_kb = *v;
+  if (auto v = pm.get_int64("meminfo.bounce_kb")) snapshot.mem_detailed.bounce_kb = *v;
+
+  if (auto v = pm.get_double("sysstat.load_avg_1")) snapshot.sys_stats.load_avg_1 = *v;
+  if (auto v = pm.get_double("sysstat.load_avg_5")) snapshot.sys_stats.load_avg_5 = *v;
+  if (auto v = pm.get_double("sysstat.load_avg_15")) snapshot.sys_stats.load_avg_15 = *v;
+  if (auto v = pm.get_int64("sysstat.procs_running")) snapshot.sys_stats.procs_running = static_cast<int>(*v);
+  if (auto v = pm.get_int64("sysstat.procs_blocked")) snapshot.sys_stats.procs_blocked = static_cast<int>(*v);
+  if (auto v = pm.get_int64("sysstat.uptime_seconds")) snapshot.sys_stats.uptime_seconds = *v;
+  if (auto v = pm.get_int64("sysstat.context_switches")) snapshot.sys_stats.context_switches = static_cast<uint64_t>(*v);
+  if (auto v = pm.get_int64("sysstat.interrupts")) snapshot.sys_stats.interrupts = static_cast<uint64_t>(*v);
+  if (auto v = pm.get_int64("sysstat.softirqs")) snapshot.sys_stats.softirqs = static_cast<uint64_t>(*v);
+  if (auto v = pm.get_int64("sysstat.forks")) snapshot.sys_stats.forks = static_cast<uint64_t>(*v);
+  if (auto v = pm.get_int64("sysstat.fd_open")) snapshot.sys_stats.fd_open = static_cast<uint64_t>(*v);
+  if (auto v = pm.get_int64("sysstat.fd_max")) snapshot.sys_stats.fd_max = static_cast<uint64_t>(*v);
 
   if (config.show_gpu) {
     auto gpu_metrics = pm.get_by_prefix("gpu.");
@@ -2134,6 +2855,12 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     return;
   }
 
+  if (config.pro_mode) {
+    renderProMode(stdscr, snapshot, config, processes, loading);
+    doupdate();
+    return;
+  }
+
   const std::string logo = " hmon " + std::string(version::kCurrent) + " ";
   const std::string status = "Host: " + host + "  |  Refresh: " +
                              (refresh_interval_ms >= 1000 ? std::to_string(refresh_interval_ms / 1000) + "s" :
@@ -2166,7 +2893,7 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     mvaddch(1, x, ACS_HLINE);
   }
 
-  std::string shortcuts = " q:Quit  z:Zen  s:Sort  l:Lock  u:Unlock  +/-:Speed  r:Refresh  ?:Help ";
+  std::string shortcuts = " q:Quit  z:Zen  s:Sort  l:Lock  u:Unlock  P:Pro   +/-:Speed  r:Refresh  ?:Help ";
   attron(A_REVERSE);
   mvaddnstr(rows - 1, 0, shortcuts.c_str(), cols);
   attroff(A_REVERSE);
@@ -2388,6 +3115,17 @@ int main(int argc, char* argv[]) {
         config.zen_ports_scroll = 0;
         config.zen_services_scroll = 0;
         config.zen_focus = ZenFocus::kNone;
+      } else {
+        pm.control("docker", "docker.enable", 0);
+      }
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'p' || ch == 'P') {
+      config.pro_mode = !config.pro_mode;
+      if (config.pro_mode) {
+        pm.control("docker", "docker.enable", 1);
       } else {
         pm.control("docker", "docker.enable", 0);
       }

@@ -13,6 +13,13 @@ struct CpuMetrics {
   std::optional<double> frequency_mhz;
   std::optional<double> usage_percent;
   std::vector<double> core_usage_percent;
+  std::vector<double> core_user_pct;
+  std::vector<double> core_system_pct;
+  std::vector<double> core_idle_pct;
+  std::vector<double> core_iowait_pct;
+  std::vector<double> core_irq_pct;
+  std::vector<double> core_softirq_pct;
+  std::vector<double> core_steal_pct;
 };
 
 struct RamMetrics {
@@ -49,6 +56,66 @@ struct NetworkMetrics {
   std::string interface;
   std::optional<double> rx_kbps;
   std::optional<double> tx_kbps;
+};
+
+struct DiskIoDevice {
+  std::string name;
+  double read_kbps = 0.0;
+  double write_kbps = 0.0;
+  double busy_percent = 0.0;
+  uint64_t read_ops = 0;
+  uint64_t write_ops = 0;
+};
+
+struct DiskIoMetrics {
+  std::vector<DiskIoDevice> devices;
+};
+
+struct NetConnStats {
+  int established = 0;
+  int syn_sent = 0;
+  int syn_recv = 0;
+  int fin_wait1 = 0;
+  int fin_wait2 = 0;
+  int time_wait = 0;
+  int close = 0;
+  int close_wait = 0;
+  int last_ack = 0;
+  int listen = 0;
+  int closing = 0;
+};
+
+struct MemInfoDetailed {
+  std::optional<long long> buffers_kb;
+  std::optional<long long> cached_kb;
+  std::optional<long long> shared_kb;
+  std::optional<long long> slab_kb;
+  std::optional<long long> sreclaimable_kb;
+  std::optional<long long> active_kb;
+  std::optional<long long> inactive_kb;
+  std::optional<long long> dirty_kb;
+  std::optional<long long> writeback_kb;
+  std::optional<long long> hugepages_total_kb;
+  std::optional<long long> mapped_kb;
+  std::optional<long long> page_tables_kb;
+  std::optional<long long> nfs_unstable_kb;
+  std::optional<long long> bounce_kb;
+};
+
+struct SystemStats {
+  double load_avg_1 = 0.0;
+  double load_avg_5 = 0.0;
+  double load_avg_15 = 0.0;
+  int procs_running = 0;
+  int procs_blocked = 0;
+  int64_t uptime_seconds = 0;
+  int64_t total_processes = 0;
+  uint64_t context_switches = 0;
+  uint64_t interrupts = 0;
+  uint64_t softirqs = 0;
+  uint64_t forks = 0;
+  uint64_t fd_open = 0;
+  uint64_t fd_max = 0;
 };
 
 struct ProcessInfo {
@@ -121,7 +188,11 @@ struct Snapshot {
   RamMetrics ram;
   SwapMetrics swap;
   DiskMetrics disk;
+  DiskIoMetrics disk_io;
   NetworkMetrics network;
+  NetConnStats net_conn;
+  MemInfoDetailed mem_detailed;
+  SystemStats sys_stats;
   std::vector<GpuMetrics> gpus;
   std::vector<ProcessInfo> processes;
   std::vector<DockerContainer> docker_containers;

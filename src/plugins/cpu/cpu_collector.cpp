@@ -390,4 +390,83 @@ std::vector<double> collectPerCoreUsagePercent(CpuPluginCtx* ctx) {
     return core_usage;
 }
 
+std::vector<CoreCycles> collectPerCoreCycles(CpuPluginCtx* ctx) {
+    std::vector<CoreCycles> result;
+    std::ifstream f("/proc/stat");
+    if (!f) return result;
+
+    std::vector<std::array<unsigned long long, 8>> cpu_values;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() <= 3 || line[0] != 'c' || line[1] != 'p' || line[2] != 'u' ||
+            !std::isdigit(static_cast<unsigned char>(line[3]))) {
+            continue;
+        }
+        std::istringstream iss(line);
+        std::string tag;
+        iss >> tag;
+        std::array<unsigned long long, 8> vals{};
+        bool valid = true;
+        for (int i = 0; i < 8; i++) {
+            if (!(iss >> vals[i])) { valid = false; break; }
+        }
+        if (valid) cpu_values.push_back(vals);
+    }
+
+    if (cpu_values.empty()) return result;
+
+    if (ctx->core_cycle_states.size() != cpu_values.size()) {
+        ctx->core_cycle_states.resize(cpu_values.size());
+        for (size_t i = 0; i < cpu_values.size(); i++) {
+            ctx->core_cycle_states[i].user = cpu_values[i][0];
+            ctx->core_cycle_states[i].nice = cpu_values[i][1];
+            ctx->core_cycle_states[i].system = cpu_values[i][2];
+            ctx->core_cycle_states[i].idle = cpu_values[i][3];
+            ctx->core_cycle_states[i].iowait = cpu_values[i][4];
+            ctx->core_cycle_states[i].irq = cpu_values[i][5];
+            ctx->core_cycle_states[i].softirq = cpu_values[i][6];
+            ctx->core_cycle_states[i].steal = cpu_values[i][7];
+            ctx->core_cycle_states[i].initialized = true;
+        }
+        result.resize(cpu_values.size());
+        return result;
+    }
+
+    result.reserve(cpu_values.size());
+    for (size_t i = 0; i < cpu_values.size(); i++) {
+        const auto& v = cpu_values[i];
+        auto& s = ctx->core_cycle_states[i];
+
+        const unsigned long long user_delta = v[0] - s.user;
+        const unsigned long long nice_delta = v[1] - s.nice;
+        const unsigned long long system_delta = v[2] - s.system;
+        const unsigned long long idle_delta = v[3] - s.idle;
+        const unsigned long long iowait_delta = v[4] - s.iowait;
+        const unsigned long long irq_delta = v[5] - s.irq;
+        const unsigned long long softirq_delta = v[6] - s.softirq;
+        const unsigned long long steal_delta = v[7] - s.steal;
+
+        unsigned long long total_delta =
+            user_delta + nice_delta + system_delta + idle_delta +
+            iowait_delta + irq_delta + softirq_delta + steal_delta;
+
+        CoreCycles cyc;
+        if (total_delta > 0) {
+            cyc.user_pct = 100.0 * static_cast<double>(user_delta + nice_delta) / static_cast<double>(total_delta);
+            cyc.nice_pct = 100.0 * static_cast<double>(nice_delta) / static_cast<double>(total_delta);
+            cyc.system_pct = 100.0 * static_cast<double>(system_delta) / static_cast<double>(total_delta);
+            cyc.idle_pct = 100.0 * static_cast<double>(idle_delta) / static_cast<double>(total_delta);
+            cyc.iowait_pct = 100.0 * static_cast<double>(iowait_delta) / static_cast<double>(total_delta);
+            cyc.irq_pct = 100.0 * static_cast<double>(irq_delta) / static_cast<double>(total_delta);
+            cyc.softirq_pct = 100.0 * static_cast<double>(softirq_delta) / static_cast<double>(total_delta);
+            cyc.steal_pct = 100.0 * static_cast<double>(steal_delta) / static_cast<double>(total_delta);
+        }
+        s.user = v[0]; s.nice = v[1]; s.system = v[2]; s.idle = v[3];
+        s.iowait = v[4]; s.irq = v[5]; s.softirq = v[6]; s.steal = v[7];
+        result.push_back(cyc);
+    }
+
+    return result;
+}
+
 } /* namespace hmon::plugins::cpu */
