@@ -48,7 +48,7 @@ Consolidated single-screen view with Docker, ports, services, databases, cron, a
 <!-- TODO: Add pro mode screenshot -->
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c4abbf21-cfc0-49c3-bac0-3f21450b322e" />
 
-Dense two-column layout with kernel stats, per-core CPU cycles, detailed memory breakdown, file descriptors, GPU, network connections, disk I/O, Docker containers, and listening ports. Full-width process table at the bottom. Toggle with `P`.
+Dense two-column layout with kernel stats, per-core CPU cycles, detailed memory breakdown, file descriptors, GPU, network connections, disk I/O.Toggle with `P`.
 
 ---
 
