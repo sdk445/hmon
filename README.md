@@ -85,14 +85,14 @@ cmake --build build -j
 ### Install
 
 ```bash
-sudo cmake --install build
+sudo cmake --build build --target install
 ```
 
 Or with a custom prefix:
 
 ```bash
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
-sudo cmake --install build
+sudo cmake --build build --target install
 ```
 
 ---
