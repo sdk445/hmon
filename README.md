@@ -1,115 +1,179 @@
 <p align="center">
-  <img width="1095" height="577" alt="image" src="https://github.com/user-attachments/assets/95d62f59-1005-4cbd-86e8-d0b0494a341c" />
+  <img width="1095" height="577" alt="hmon" src="https://github.com/user-attachments/assets/95d62f59-1005-4cbd-86e8-d0b0494a341c" />
 </p>
-<h1 align="center">hmon is a Linux resource monitor.</h1>
 
-
-<!-- <p align="center">
-  <video src="https://github.com/user-attachments/assets/1dc15b42-e694-4bcc-bd98-9ef2fd17d9d1"
-         controls
-         width="800">
-  </video>
-</p> -->
-
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/66df0127-5ca5-40cd-93cd-bbe13564e775" />
-
-##ZEN MODE
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/2bee6e79-d8a1-46b6-9410-ca6759416669" />
+<h1 align="center">hmon</h1>
+<p align="center">A fast, lightweight Linux system monitor built in C++ and ncurses.</p>
 
 <p align="center">
-<img width="861" height="434" alt="572344879-dbe92899-322b-4f08-9847-12797d811721 (1)" src="https://github.com/user-attachments/assets/e1bdbc3f-5deb-4bd7-bdaf-724daad46a44" />
+  <a href="#features">Features</a> •
+  <a href="#modes">Modes</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#usage">Usage</a> •
+  <a href="#controls">Controls</a> •
+  <a href="#telemetry-sources">Telemetry Sources</a>
 </p>
-<!-- <img width="1907" height="966" alt="image" src="https://github.com/user-attachments/assets/28522c36-2218-41ce-b03a-a46733043969" /> -->
-<!-- <img width="1919" height="1063" alt="image" src="https://github.com/user-attachments/assets/2882f417-b740-4905-8f6f-80dc18bb707f" /> -->
 
+---
 
-- Disk space left
-- CPU temperature, speed, usage.
-- GPU temperature, speed, usage, wattage, and VRAM usage
-- RAM consumption
-- Network throughput  
-- DISK consumption
-- TOP processes
+## Features
 
-## Requirements
+- **CPU** — usage, temperature, frequency, per-core cycle breakdown
+- **GPU** — utilization, temperature, clock, power draw, VRAM (NVIDIA + AMD/Intel fallback)
+- **Memory** — usage, buffers, cache, slab, swap, detailed `/proc/meminfo` breakdown
+- **Disk** — space usage, per-device I/O throughput and busy %
+- **Network** — interface throughput (RX/TX), TCP connection states
+- **Processes** — top processes sorted by CPU, memory, GPU, or PID
+- **Docker** — container status, CPU/memory per container
+- **Ports** — listening ports with bound process
+- **Services** — systemd unit status
+- **History** — activity graphs with braille-character rendering
 
-- Linux
-- C++17 compiler (`g++` or `clang++`)
-- CMake 3.16+
-- `ncurses` development package
+## Modes
 
-Ubuntu/Debian:
+### Default
+
+Full dashboard with paneled layout — CPU, RAM, GPU, disk, network, and activity history.
+
+<img width="1920" height="1080" alt="default mode" src="https://github.com/user-attachments/assets/66df0127-5ca5-40cd-93cd-bbe13564e775" />
+
+### Zen Mode
+
+Consolidated single-screen view with Docker, ports, services, databases, cron, and top processes. Toggle with `z`.
+
+<img width="1920" height="1080" alt="zen mode" src="https://github.com/user-attachments/assets/2bee6e79-d8a1-46b6-9410-ca6759416669" />
+
+### Pro Mode
+
+<!-- TODO: Add pro mode screenshot -->
+
+Dense two-column layout with kernel stats, per-core CPU cycles, detailed memory breakdown, file descriptors, GPU, network connections, disk I/O, Docker containers, and listening ports. Full-width process table at the bottom. Toggle with `P`.
+
+---
+
+## Installation
+
+### Requirements
+
+| Dependency | Version |
+|---|---|
+| Linux | any |
+| C++ compiler | C++17 (`g++` or `clang++`) |
+| CMake | 3.16+ |
+| ncurses | dev package |
+
+**Ubuntu/Debian:**
 
 ```bash
-sudo apt update
 sudo apt install -y build-essential cmake libncurses-dev
 ```
 
-Optional (for NVIDIA GPU telemetry):
+**Optional** — NVIDIA GPU telemetry:
 
 ```bash
 sudo apt install -y nvidia-utils-<version>
 ```
 
-Optional (for linting):
-
-```bash
-sudo apt install -y clang-tidy
-```
-
-## Build
+### Build
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-## Lint
-
-Run lint checks globally:
+### Install
 
 ```bash
-cmake -S . -B build
-cmake --build build --target lint
-```
-
-Enable lint checks globally during every build:
-
-```bash
-cmake -S . -B build -DHMON_ENABLE_CLANG_TIDY=ON
-cmake --build build -j
-```
-
-## Run
-
-```bash
-./build/hmon
-```
-
-## Install
-
-```bash
-cmake --build build --target install
+sudo cmake --install build
 ```
 
 Or with a custom prefix:
 
 ```bash
 cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
-cmake --build build --target install
+sudo cmake --install build
 ```
-[![Buy Me a Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=sdk445&button_colour=FFDD00&font_colour=000000&font_family=Lato&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/sdk445)
 
-## Notes on telemetry sources
+---
 
-- CPU temp: `/sys/class/thermal/*`
-- CPU speed: `/sys/devices/system/cpu/*/cpufreq` or `/proc/cpuinfo`
-- CPU usage: `/proc/stat` delta sampling
-- RAM: `/proc/meminfo`
-- Network: `/proc/net/dev` 
-- Disk: `statvfs("/")`
-- GPU:
-  - Primary: `nvidia-smi` (temp, core clock, fan, utilization, power draw, memory used/total)
-  - Fallback: `/sys/class/drm/*/device` + hwmon + `sensors` command
+## Usage
 
+```bash
+hmon [OPTIONS]
+```
 
+| Option | Description |
+|---|---|
+| `-h`, `--help` | Show help and exit |
+| `-v`, `--version` | Show version and exit |
+| `-r`, `--refresh <secs>` | Refresh interval in seconds (1–60, default: 1) |
+| `-t`, `--top <count>` | Number of top processes to show (1–20, default: 8) |
+| `--no-gpu` | Disable GPU telemetry |
+| `--no-history` | Disable activity history graphs |
+| `--zen` | Start in zen mode |
+| `--pid <id>` | Lock focus on a specific PID |
+| `--no-color` | Disable colors |
+
+---
+
+## Controls
+
+| Key | Action |
+|---|---|
+| `q` | Quit |
+| `?` | Toggle help overlay |
+| `z` | Toggle zen mode |
+| `P` | Toggle pro mode |
+| `s` | Cycle sort (CPU → MEM → GPU → PID) |
+| `j` / `k` / `↑` / `↓` | Navigate process list |
+| `1`–`9` | Jump to process row |
+| `l` | Lock/unlock selected PID |
+| `u` | Unlock PID |
+| `r` | Force refresh |
+| `+` / `-` | Increase/decrease refresh speed |
+| `Tab` | Cycle focus (zen mode) |
+
+---
+
+## Telemetry Sources
+
+| Metric | Source |
+|---|---|
+| CPU usage | `/proc/stat` delta sampling |
+| CPU temperature | `/sys/class/thermal/*` |
+| CPU frequency | `/sys/devices/system/cpu/*/cpufreq`, `/proc/cpuinfo` |
+| Memory | `/proc/meminfo` |
+| Network | `/proc/net/dev` |
+| Disk space | `statvfs("/")` |
+| Disk I/O | `/sys/block/*/stat` |
+| GPU (NVIDIA) | `nvidia-smi` |
+| GPU (AMD/Intel) | `/sys/class/drm/*/device` + hwmon |
+| Docker | Docker Engine API (`/var/run/docker.sock`) |
+| Ports | `/proc/net/tcp`, `/proc/net/tcp6` |
+| Services | `systemctl` |
+
+---
+
+## Lint
+
+```bash
+cmake -S . -B build
+cmake --build build --target lint
+```
+
+Enable lint checks on every build:
+
+```bash
+cmake -S . -B build -DHMON_ENABLE_CLANG_TIDY=ON
+cmake --build build -j
+```
+
+---
+
+<p align="center">
+  <a href="https://buymeacoffee.com/sdk445">
+    <img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=sdk445&button_colour=FFDD00&font_colour=000000&font_family=Lato&outline_colour=000000&coffee_colour=ffffff" alt="Buy Me a Coffee" />
+  </a>
+</p>
+
+<p align="center">MIT License © 2026 Chinmoy</p>
