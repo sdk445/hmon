@@ -1,5 +1,6 @@
+
 <p align="center">
-  <img width="1095" height="577" alt="hmon" src="https://github.com/user-attachments/assets/95d62f59-1005-4cbd-86e8-d0b0494a341c" />
+  <img width="1920" height="1080" alt="SleekhmonHeroArtworkwithMinimalClutter-ezgif com-optimize (1)" src="https://github.com/user-attachments/assets/8b54ed1a-3d94-4bc0-be32-ee349376ae78" />
 </p>
 
 <h1 align="center">hmon</h1>
