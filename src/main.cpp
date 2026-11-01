@@ -1,14 +1,17 @@
 #include <ncurses.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <clocale>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
@@ -17,9 +20,11 @@
 #include <numeric>
 #include <limits>
 #include <optional>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -123,6 +128,8 @@ struct Config {
   bool show_history = true;
   bool zen_mode = false;
   bool pro_mode = false;
+  bool show_process_history = false;
+  int process_history_scroll = 0;
   int lock_pid = -1;
   int selected_pid = -1;
   SortMode sort_mode = SortMode::kCpu;
@@ -134,6 +141,15 @@ struct Config {
   int zen_ports_scroll = 0;
   int zen_services_scroll = 0;
   ZenFocus zen_focus = ZenFocus::kNone;
+  int kill_confirm_pid = -1;
+  int kill_confirm_presses = 0;
+  uint64_t kill_confirm_start_time = 0;
+  std::chrono::steady_clock::time_point kill_confirm_deadline{};
+  std::string notice;
+  std::chrono::steady_clock::time_point notice_deadline{};
+  std::string resource_alert;
+  std::filesystem::path whitelist_path;
+  std::unordered_set<std::string> alert_whitelist;
   std::optional<std::string> cli_error;
 };
 
@@ -144,6 +160,19 @@ struct Rect {
   int w;
 };
 
+struct ProcessTrend {
+  std::string command;
+  uint64_t start_time = 0;
+  std::vector<std::chrono::steady_clock::time_point> sample_times;
+  std::vector<double> cpu_usage;
+  std::vector<double> mem_usage;
+  std::vector<double> gpu_usage;
+  std::optional<std::chrono::steady_clock::time_point> high_cpu_since;
+  std::optional<std::chrono::steady_clock::time_point> high_mem_since;
+  std::optional<std::chrono::steady_clock::time_point> high_gpu_since;
+  size_t last_seen_sample = 0;
+};
+
 struct MetricsHistory {
   std::vector<double> cpu_usage;
   std::vector<double> cpu_temp;
@@ -151,7 +180,11 @@ struct MetricsHistory {
   std::vector<double> gpu_usage;
   std::vector<double> gpu_vram_usage;
   std::vector<double> disk_usage;
+  std::unordered_map<int, ProcessTrend> processes;
+  size_t process_sample = 0;
 };
+
+std::string usageSparkline(const std::vector<double>& values, size_t width);
 
 struct BrailleCanvas {
   int width = 0;
@@ -181,6 +214,9 @@ void printHelp(const char* program_name) {
   std::cout << "Controls:\n";
   std::cout << "  q       Quit    ?       Help    z       Zen mode\n";
   std::cout << "  s       Sort    l       Lock    u       Unlock\n";
+  std::cout << "  h       Process history    c       Clear history view\n";
+  std::cout << "  w       Trust/untrust selected process for alerts\n";
+  std::cout << "  x x x   Terminate selected process (three presses)\n";
   std::cout << "  r       Refresh +/-     Speed\n";
 }
 
@@ -367,6 +403,8 @@ void syncSelection(const std::vector<ProcessInfo>& processes, Config* config) {
   }
   if (processes.empty()) {
     config->selected_pid = -1;
+    config->kill_confirm_pid = -1;
+    config->kill_confirm_presses = 0;
     return;
   }
   if (processListContainsPid(processes, config->selected_pid)) {
@@ -374,9 +412,13 @@ void syncSelection(const std::vector<ProcessInfo>& processes, Config* config) {
   }
   if (processListContainsPid(processes, config->lock_pid)) {
     config->selected_pid = config->lock_pid;
+    config->kill_confirm_pid = -1;
+    config->kill_confirm_presses = 0;
     return;
   }
   config->selected_pid = processes.front().pid;
+  config->kill_confirm_pid = -1;
+  config->kill_confirm_presses = 0;
 }
 
 void moveSelection(const std::vector<ProcessInfo>& processes, Config* config, int delta) {
@@ -387,6 +429,250 @@ void moveSelection(const std::vector<ProcessInfo>& processes, Config* config, in
   const int next_index =
       std::max(0, std::min(static_cast<int>(processes.size()) - 1, current_index + delta));
   config->selected_pid = processes[static_cast<size_t>(next_index)].pid;
+  config->kill_confirm_pid = -1;
+  config->kill_confirm_presses = 0;
+}
+
+void setNotice(Config* config, std::string message, std::chrono::seconds duration = std::chrono::seconds(4)) {
+  if (!config) return;
+  config->notice = std::move(message);
+  config->notice_deadline = std::chrono::steady_clock::now() + duration;
+}
+
+std::string processStatusLine(const Config& config) {
+  const auto now = std::chrono::steady_clock::now();
+  if (!config.notice.empty() && now < config.notice_deadline) {
+    return config.notice;
+  }
+  return config.resource_alert;
+}
+
+void drawRuntimeStatus(WINDOW* win, const Config& config) {
+  if (!win) return;
+  const std::string status = processStatusLine(config);
+  if (status.empty()) return;
+  const int row = getmaxy(win) - 1;
+  const int width = getmaxx(win);
+  if (has_colors()) wattron(win, COLOR_PAIR(2));
+  wattron(win, A_REVERSE | A_BOLD);
+  std::string line = " " + status + " ";
+  mvwaddnstr(win, row, 0, line.c_str(), width);
+  for (int x = std::min(width, static_cast<int>(line.size())); x < width; ++x) {
+    mvwaddch(win, row, x, ' ');
+  }
+  wattroff(win, A_REVERSE | A_BOLD);
+  if (has_colors()) wattroff(win, COLOR_PAIR(2));
+}
+
+std::filesystem::path alertWhitelistPath() {
+  if (const char* xdg_config = std::getenv("XDG_CONFIG_HOME"); xdg_config && *xdg_config) {
+    return std::filesystem::path(xdg_config) / "hmon" / "whitelist";
+  }
+  if (const char* user_home = std::getenv("HOME"); user_home && *user_home) {
+    return std::filesystem::path(user_home) / ".config" / "hmon" / "whitelist";
+  }
+  return {};
+}
+
+void loadAlertWhitelist(Config* config) {
+  if (!config) return;
+  config->whitelist_path = alertWhitelistPath();
+  if (config->whitelist_path.empty()) return;
+  std::ifstream input(config->whitelist_path);
+  std::string command;
+  while (std::getline(input, command)) {
+    const size_t first = command.find_first_not_of(" \t\r");
+    if (first == std::string::npos || command[first] == '#') continue;
+    const size_t last = command.find_last_not_of(" \t\r");
+    config->alert_whitelist.insert(command.substr(first, last - first + 1));
+  }
+}
+
+std::optional<std::string> saveAlertWhitelist(const Config& config) {
+  if (config.whitelist_path.empty()) return "No HOME or XDG_CONFIG_HOME; whitelist was not saved.";
+  std::error_code error;
+  std::filesystem::create_directories(config.whitelist_path.parent_path(), error);
+  if (error) return "Could not create whitelist directory: " + error.message();
+
+  std::filesystem::path temporary = config.whitelist_path;
+  temporary += ".tmp";
+  std::ofstream output(temporary, std::ios::trunc);
+  if (!output) return "Could not write process whitelist.";
+  std::vector<std::string> commands(config.alert_whitelist.begin(), config.alert_whitelist.end());
+  std::sort(commands.begin(), commands.end());
+  for (const auto& command : commands) output << command << '\n';
+  output.close();
+  if (!output) {
+    std::filesystem::remove(temporary, error);
+    return "Could not finish writing process whitelist.";
+  }
+  std::filesystem::rename(temporary, config.whitelist_path, error);
+  if (error) {
+    std::filesystem::remove(temporary, error);
+    return "Could not replace process whitelist: " + error.message();
+  }
+  return std::nullopt;
+}
+
+void toggleAlertWhitelist(Config* config, const std::vector<ProcessInfo>& processes,
+                          const MetricsHistory* history = nullptr) {
+  if (!config || config->selected_pid <= 0) {
+    setNotice(config, "No process selected.");
+    return;
+  }
+  if (!config->show_process_history && !config->show_selection_highlight &&
+      config->lock_pid != config->selected_pid) {
+    setNotice(config, "Select a process with j/k or 1-9 before trusting it.");
+    return;
+  }
+  const auto selected = std::find_if(processes.begin(), processes.end(), [&](const ProcessInfo& process) {
+    return process.pid == config->selected_pid;
+  });
+  std::string command;
+  if (selected != processes.end()) {
+    command = selected->command;
+  } else if (history) {
+    const auto previous = history->processes.find(config->selected_pid);
+    if (previous != history->processes.end()) command = previous->second.command;
+  }
+  if (command.empty()) {
+    setNotice(config, "Selected process is no longer available.");
+    return;
+  }
+
+  const bool was_trusted = config->alert_whitelist.erase(command) > 0;
+  if (!was_trusted) config->alert_whitelist.insert(command);
+  if (const auto error = saveAlertWhitelist(*config)) {
+    if (was_trusted) config->alert_whitelist.insert(command);
+    else config->alert_whitelist.erase(command);
+    setNotice(config, *error);
+    return;
+  }
+  config->resource_alert.clear();
+  setNotice(config, command + (was_trusted ? " removed from trusted processes." : " trusted; alerts muted."));
+}
+
+std::string readProcessName(int pid) {
+#ifdef __linux__
+  std::ifstream input("/proc/" + std::to_string(pid) + "/comm");
+  std::string name;
+  if (input && std::getline(input, name)) return name;
+#else
+  (void)pid;
+#endif
+  return "";
+}
+
+std::optional<uint64_t> readProcessStartTime(int pid) {
+#ifdef __linux__
+  std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
+  std::string line;
+  if (!input || !std::getline(input, line)) return std::nullopt;
+  const size_t command_end = line.rfind(')');
+  if (command_end == std::string::npos || command_end + 2 >= line.size()) return std::nullopt;
+  std::istringstream fields(line.substr(command_end + 2));
+  std::string value;
+  for (int field = 3; field <= 22; ++field) {
+    if (!(fields >> value)) return std::nullopt;
+  }
+  try {
+    return std::stoull(value);
+  } catch (...) {
+    return std::nullopt;
+  }
+#else
+  (void)pid;
+  return std::nullopt;
+#endif
+}
+
+void handleKillPress(Config* config, const std::vector<ProcessInfo>& processes,
+                     const MetricsHistory* history = nullptr) {
+  if (!config || config->selected_pid <= 0) {
+    setNotice(config, "No process selected.");
+    return;
+  }
+  if (config->zen_mode && !config->show_process_history) {
+    setNotice(config, "Process termination is available in default or Pro mode.");
+    return;
+  }
+  if (!config->show_selection_highlight && config->lock_pid != config->selected_pid) {
+    setNotice(config, "Select a process with j/k or 1-9 before terminating it.");
+    return;
+  }
+
+  const int pid = config->selected_pid;
+  const auto selected = std::find_if(processes.begin(), processes.end(),
+      [pid](const ProcessInfo& process) { return process.pid == pid; });
+  std::string command;
+  uint64_t expected_start_time = 0;
+  if (selected != processes.end()) {
+    command = selected->command;
+  }
+  if (history) {
+    const auto previous = history->processes.find(pid);
+    if (previous != history->processes.end()) {
+      if (command.empty()) command = previous->second.command;
+      expected_start_time = previous->second.start_time;
+    }
+  }
+  if (command.empty()) {
+    setNotice(config, "PID " + std::to_string(pid) + " is no longer in history.");
+    return;
+  }
+  if (pid == 1 || pid == static_cast<int>(getpid())) {
+    setNotice(config, "Refusing to terminate protected PID " + std::to_string(pid) + ".");
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (config->kill_confirm_pid != pid || now >= config->kill_confirm_deadline) {
+    const auto start_time = readProcessStartTime(pid);
+    if (!start_time) {
+      setNotice(config, "PID " + std::to_string(pid) + " already exited.");
+      return;
+    }
+    if (expected_start_time != 0 && *start_time != expected_start_time) {
+      setNotice(config, "PID " + std::to_string(pid) + " changed identity; termination cancelled.");
+      return;
+    }
+    config->kill_confirm_pid = pid;
+    config->kill_confirm_presses = 1;
+    config->kill_confirm_start_time = *start_time;
+    config->kill_confirm_deadline = now + std::chrono::seconds(3);
+  } else {
+    ++config->kill_confirm_presses;
+  }
+
+  if (config->kill_confirm_presses < 3) {
+    const int remaining = 3 - config->kill_confirm_presses;
+    setNotice(config, "Terminate " + command + " (PID " + std::to_string(pid) + ")? Press x " +
+                         std::to_string(remaining) + " more time" + (remaining == 1 ? "." : "s."),
+              std::chrono::seconds(3));
+    return;
+  }
+
+  config->kill_confirm_pid = -1;
+  config->kill_confirm_presses = 0;
+  const auto current_start_time = readProcessStartTime(pid);
+  if (!current_start_time || *current_start_time != config->kill_confirm_start_time) {
+    setNotice(config, "PID " + std::to_string(pid) + " changed identity; termination cancelled.");
+    return;
+  }
+  const std::string current_name = readProcessName(pid);
+  if (current_name.empty()) {
+    setNotice(config, "PID " + std::to_string(pid) + " already exited.");
+    return;
+  }
+  if (current_name != command) {
+    setNotice(config, "PID " + std::to_string(pid) + " changed identity; termination cancelled.");
+    return;
+  }
+  if (::kill(pid, SIGTERM) == 0) {
+    setNotice(config, "SIGTERM sent to " + command + " (PID " + std::to_string(pid) + ").");
+    return;
+  }
+  setNotice(config, "Could not terminate PID " + std::to_string(pid) + ": " + std::strerror(errno));
 }
 
 bool gpuHasTelemetry(const GpuMetrics& gpu) {
@@ -1183,6 +1469,9 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history,
 
   int table_row = table_top;
   bool show_gpu_col = true;
+  const bool show_trend_col = max_x >= 90;
+  const char* trend_label = sort_mode == SortMode::kMem ? "MEM TREND" :
+                            sort_mode == SortMode::kGpu ? "GPU TREND" : "CPU TREND";
 
   wattron(panel, A_BOLD);
   int col = 2;
@@ -1236,6 +1525,11 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history,
     }
     col += 8;
   }
+
+  if (show_trend_col) {
+    mvwaddstr(panel, table_row, col, trend_label);
+    col += 12;
+  }
   
   mvwaddstr(panel, table_row, col, "COMMAND");
   table_row++;
@@ -1264,6 +1558,18 @@ void renderHistoryPanel(WINDOW* panel, const MetricsHistory& history,
          << std::setw(6) << std::fixed << std::setprecision(1) << process.mem_percent;
     if (show_gpu_col) {
       line << " " << std::setw(6) << std::fixed << std::setprecision(1) << process.gpu_percent;
+    }
+    if (show_trend_col) {
+      const auto trend = history.processes.find(process.pid);
+      line << "  ";
+      if (trend != history.processes.end()) {
+        const std::vector<double>* values = &trend->second.cpu_usage;
+        if (sort_mode == SortMode::kMem) values = &trend->second.mem_usage;
+        if (sort_mode == SortMode::kGpu) values = &trend->second.gpu_usage;
+        line << usageSparkline(*values, 10);
+      } else {
+        line << std::string(10, ' ');
+      }
     }
     line << " ";
     if (is_locked) {
@@ -2350,7 +2656,7 @@ void renderProMode(WINDOW* win, const Snapshot& snapshot, const Config& config,
 
   /* Bottom bar */
   {
-    std::string shortcuts = " q:Quit  z:Zen  P:Pro  s:Sort  j/k:Nav  l:Lock  +/-:Speed  ?:Help ";
+    std::string shortcuts = " q:Quit  h:History  w:Trust  z:Zen  P:Pro  s:Sort  j/k:Nav  x3:Kill  ?:Help ";
     wattron(win, A_REVERSE);
     mvwaddnstr(win, max_y - 1, 0, shortcuts.c_str(), max_x);
     for (int x = static_cast<int>(shortcuts.size()); x < max_x; ++x)
@@ -2382,8 +2688,10 @@ void drawHelpOverlay(WINDOW* overlay, const Config& config) {
   mvwaddstr(overlay, row++, 4, "z       Zen mode");
   mvwaddstr(overlay, row++, 4, "s       Sort (CPU/MEM/GPU/PID)");
   mvwaddstr(overlay, row++, 4, "j/k     Move selection");
-  mvwaddstr(overlay, row++, 4, "Up/Down Move selection");
   mvwaddstr(overlay, row++, 4, "1-9     Jump to row");
+  mvwaddstr(overlay, row++, 4, "h       Process history");
+  mvwaddstr(overlay, row++, 4, "w       Trust/untrust alerts");
+  mvwaddstr(overlay, row++, 4, "x x x   Terminate selected PID");
   if (config.lock_pid > 0) {
     std::string pid_msg = "l/u     Toggle lock on PID " + std::to_string(config.lock_pid);
     mvwaddstr(overlay, row++, 4, pid_msg.c_str());
@@ -2395,8 +2703,6 @@ void drawHelpOverlay(WINDOW* overlay, const Config& config) {
   }
   mvwaddstr(overlay, row++, 4, "r       Refresh");
   mvwaddstr(overlay, row++, 4, "+/-     Speed");
-  mvwaddstr(overlay, row++, 4, "P       Pro mode (detailed metrics)");
-  mvwaddstr(overlay, row++, 4, "Any key - Close help");
 
   wnoutrefresh(overlay);
 }
@@ -2751,7 +3057,8 @@ Snapshot collectSnapshot(hmon::core::PluginManager& pm, const Config& config) {
   return snapshot;
 }
 
-std::vector<ProcessInfo> collectProcesses(hmon::core::PluginManager& pm, size_t limit, SortMode /*sort_mode*/, int /*lock_pid*/) {
+std::vector<ProcessInfo> collectProcesses(hmon::core::PluginManager& pm, size_t limit, SortMode sort_mode,
+                                          int lock_pid, std::vector<ProcessInfo>* candidates = nullptr) {
   std::vector<ProcessInfo> processes;
 
   auto proc_metrics = pm.get_by_prefix("proc.");
@@ -2773,13 +3080,257 @@ std::vector<ProcessInfo> collectProcesses(hmon::core::PluginManager& pm, size_t 
     }
   }
 
-  for (size_t i = 0; i < proc_map.size() && processes.size() < limit; ++i) {
+  for (size_t i = 0; i < proc_map.size(); ++i) {
     if (proc_map.count(i)) {
       processes.push_back(proc_map[i]);
     }
   }
 
+  const auto descending = [](auto member) {
+    return [member](const ProcessInfo& a, const ProcessInfo& b) { return a.*member > b.*member; };
+  };
+  switch (sort_mode) {
+    case SortMode::kCpu:
+      std::stable_sort(processes.begin(), processes.end(), descending(&ProcessInfo::cpu_percent));
+      break;
+    case SortMode::kMem:
+      std::stable_sort(processes.begin(), processes.end(), descending(&ProcessInfo::mem_percent));
+      break;
+    case SortMode::kGpu:
+      std::stable_sort(processes.begin(), processes.end(), descending(&ProcessInfo::gpu_percent));
+      break;
+    case SortMode::kPid:
+      std::stable_sort(processes.begin(), processes.end(),
+                       [](const ProcessInfo& a, const ProcessInfo& b) { return a.pid < b.pid; });
+      break;
+  }
+
+  if (candidates) *candidates = processes;
+
+  if (lock_pid > 0) {
+    const auto locked = std::find_if(processes.begin(), processes.end(),
+        [lock_pid](const ProcessInfo& process) { return process.pid == lock_pid; });
+    if (locked != processes.end() && static_cast<size_t>(locked - processes.begin()) >= limit) {
+      ProcessInfo locked_process = *locked;
+      processes.erase(locked);
+      processes.insert(processes.begin(), std::move(locked_process));
+    }
+  }
+  if (processes.size() > limit) processes.resize(limit);
+
   return processes;
+}
+
+void pruneProcessTrend(ProcessTrend* trend, std::chrono::steady_clock::time_point cutoff) {
+  if (!trend) return;
+  const auto first_kept = std::lower_bound(trend->sample_times.begin(), trend->sample_times.end(), cutoff);
+  const size_t remove_count = static_cast<size_t>(first_kept - trend->sample_times.begin());
+  if (remove_count == 0) return;
+  trend->sample_times.erase(trend->sample_times.begin(), first_kept);
+  auto erase_values = [remove_count](std::vector<double>* values) {
+    values->erase(values->begin(), values->begin() + static_cast<std::ptrdiff_t>(remove_count));
+  };
+  erase_values(&trend->cpu_usage);
+  erase_values(&trend->mem_usage);
+  erase_values(&trend->gpu_usage);
+}
+
+void updateProcessHistory(MetricsHistory* history, const std::vector<ProcessInfo>& processes,
+                          Config* config) {
+  if (!history || !config) return;
+  ++history->process_sample;
+  const auto now = std::chrono::steady_clock::now();
+  const auto cutoff = now - std::chrono::minutes(1);
+
+  const ProcessInfo* alert_process = nullptr;
+  std::string alert_metric;
+  double alert_value = 0.0;
+  double alert_score = 0.0;
+  for (const auto& process : processes) {
+    ProcessTrend& trend = history->processes[process.pid];
+    const uint64_t sampled_start_time = readProcessStartTime(process.pid).value_or(0);
+    if ((!trend.command.empty() && trend.command != process.command) ||
+        (trend.start_time != 0 && sampled_start_time != 0 && trend.start_time != sampled_start_time)) {
+      trend = ProcessTrend{};
+    }
+    if (trend.last_seen_sample != 0 && trend.last_seen_sample + 1 < history->process_sample) {
+      trend.high_cpu_since.reset();
+      trend.high_mem_since.reset();
+      trend.high_gpu_since.reset();
+    }
+    trend.command = process.command;
+    trend.start_time = sampled_start_time;
+    trend.last_seen_sample = history->process_sample;
+    trend.sample_times.push_back(now);
+    trend.cpu_usage.push_back(std::clamp(process.cpu_percent, 0.0, 100.0));
+    trend.mem_usage.push_back(std::clamp(process.mem_percent, 0.0, 100.0));
+    trend.gpu_usage.push_back(std::clamp(process.gpu_percent, 0.0, 100.0));
+    const auto update_high_since = [&](double value, double threshold,
+                                       std::optional<std::chrono::steady_clock::time_point>* since) {
+      if (value < threshold) since->reset();
+      else if (!*since) *since = now;
+    };
+    update_high_since(process.cpu_percent, 85.0, &trend.high_cpu_since);
+    update_high_since(process.mem_percent, 20.0, &trend.high_mem_since);
+    update_high_since(process.gpu_percent, 90.0, &trend.high_gpu_since);
+
+    const bool trusted = config->alert_whitelist.contains(process.command);
+    if (trusted) {
+      trend.high_cpu_since.reset();
+      trend.high_mem_since.reset();
+      trend.high_gpu_since.reset();
+    }
+
+    const auto consider = [&](const std::optional<std::chrono::steady_clock::time_point>& since,
+                              double value, double threshold, const char* metric) {
+      const double score = value / threshold;
+      if (!trusted && since && now - *since >= std::chrono::seconds(15) && score > alert_score) {
+        alert_process = &process;
+        alert_metric = metric;
+        alert_value = value;
+        alert_score = score;
+      }
+    };
+    consider(trend.high_cpu_since, process.cpu_percent, 85.0, "CPU");
+    consider(trend.high_mem_since, process.mem_percent, 20.0, "memory");
+    consider(trend.high_gpu_since, process.gpu_percent, 90.0, "GPU");
+  }
+
+  for (auto it = history->processes.begin(); it != history->processes.end();) {
+    pruneProcessTrend(&it->second, cutoff);
+    if (it->second.sample_times.empty()) {
+      it = history->processes.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  const bool had_alert = !config->resource_alert.empty();
+  if (alert_process) {
+    std::ostringstream message;
+    message << "High usage  " << alert_process->command << " (PID " << alert_process->pid << ")  "
+            << std::fixed << std::setprecision(1) << alert_value << "% " << alert_metric;
+    config->resource_alert = message.str();
+    if (!had_alert) beep();
+  } else {
+    config->resource_alert.clear();
+  }
+}
+
+std::string usageSparkline(const std::vector<double>& values, size_t width) {
+  static constexpr char levels[] = " .:-=+*#%@";
+  if (values.empty() || width == 0) return "";
+  const size_t count = std::min(width, values.size());
+  const size_t start = values.size() - count;
+  std::string result(width - count, ' ');
+  for (size_t i = start; i < values.size(); ++i) {
+    const double value = std::clamp(values[i], 0.0, 100.0);
+    const size_t level = static_cast<size_t>(std::lround(value * 9.0 / 100.0));
+    result.push_back(levels[std::min<size_t>(9, level)]);
+  }
+  return result;
+}
+
+double historyPeak(const std::vector<double>& values) {
+  return values.empty() ? 0.0 : *std::max_element(values.begin(), values.end());
+}
+
+double processTopUsage(const ProcessTrend& trend) {
+  return std::max({historyPeak(trend.cpu_usage), historyPeak(trend.mem_usage),
+                   historyPeak(trend.gpu_usage)});
+}
+
+std::vector<std::pair<int, const ProcessTrend*>> rankedProcessHistory(const MetricsHistory& history) {
+  std::vector<std::pair<int, const ProcessTrend*>> entries;
+  entries.reserve(history.processes.size());
+  for (const auto& [pid, trend] : history.processes) entries.emplace_back(pid, &trend);
+  std::stable_sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+    const double a_usage = processTopUsage(*a.second);
+    const double b_usage = processTopUsage(*b.second);
+    if (a_usage != b_usage) return a_usage > b_usage;
+    return a.first < b.first;
+  });
+  return entries;
+}
+
+void moveHistorySelection(const MetricsHistory& history, Config* config, int delta, int visible_rows) {
+  if (!config) return;
+  const auto entries = rankedProcessHistory(history);
+  if (entries.empty()) {
+    config->selected_pid = -1;
+    config->process_history_scroll = 0;
+    return;
+  }
+  auto current = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+    return entry.first == config->selected_pid;
+  });
+  int index = current == entries.end() ? 0 : static_cast<int>(current - entries.begin());
+  index = std::clamp(index + delta, 0, static_cast<int>(entries.size()) - 1);
+  config->selected_pid = entries[static_cast<size_t>(index)].first;
+  config->show_selection_highlight = true;
+  config->kill_confirm_pid = -1;
+  config->kill_confirm_presses = 0;
+  visible_rows = std::max(1, visible_rows);
+  if (index < config->process_history_scroll) config->process_history_scroll = index;
+  if (index >= config->process_history_scroll + visible_rows)
+    config->process_history_scroll = index - visible_rows + 1;
+}
+
+void renderProcessHistoryView(WINDOW* win, const MetricsHistory& history, const Config& config) {
+  if (!win) return;
+  const int rows = getmaxy(win);
+  const int cols = getmaxx(win);
+  const std::string title = " PROCESS USAGE  LAST 60 SECONDS ";
+  wattron(win, A_BOLD | A_REVERSE);
+  mvwaddnstr(win, 0, 0, title.c_str(), cols);
+  for (int x = std::min(cols, static_cast<int>(title.size())); x < cols; ++x) mvwaddch(win, 0, x, ' ');
+  wattroff(win, A_BOLD | A_REVERSE);
+
+  const auto entries = rankedProcessHistory(history);
+
+  const int command_width = std::max(12, cols - 55);
+  std::ostringstream header;
+  header << std::left << std::setw(5) << "#" << std::setw(7) << "PID"
+         << std::setw(command_width) << "PROCESS" << std::right
+         << std::setw(11) << "CPU MAX" << std::setw(11) << "MEM MAX"
+         << std::setw(11) << "GPU MAX" << std::setw(10) << "TOP";
+  wattron(win, A_BOLD);
+  mvwaddnstr(win, 2, 0, header.str().c_str(), cols);
+  wattroff(win, A_BOLD);
+  for (int x = 0; x < cols; ++x) mvwaddch(win, 3, x, ACS_HLINE);
+
+  int row = 4;
+  const int visible_rows = std::max(1, rows - 5);
+  const int max_scroll = std::max(0, static_cast<int>(entries.size()) - visible_rows);
+  const int start = std::clamp(config.process_history_scroll, 0, max_scroll);
+  size_t rank = static_cast<size_t>(start + 1);
+  for (size_t index = static_cast<size_t>(start); index < entries.size(); ++index) {
+    if (row >= rows - 1) break;
+    const auto& [pid, trend] = entries[index];
+    std::string command = (config.alert_whitelist.contains(trend->command) ? "* " : "  ") + trend->command;
+    command = command.substr(0, static_cast<size_t>(command_width - 1));
+    std::ostringstream line;
+    line << std::left << std::setw(5) << rank++ << std::setw(7) << pid << std::setw(command_width) << command
+         << std::right << std::fixed << std::setprecision(1)
+         << std::setw(11) << historyPeak(trend->cpu_usage)
+         << std::setw(11) << historyPeak(trend->mem_usage)
+         << std::setw(11) << historyPeak(trend->gpu_usage)
+         << std::setw(10) << processTopUsage(*trend);
+    if (pid == config.selected_pid) wattron(win, A_REVERSE);
+    mvwaddnstr(win, row++, 0, line.str().c_str(), cols);
+    if (pid == config.selected_pid) wattroff(win, A_REVERSE);
+  }
+  if (entries.empty()) {
+    mvwaddnstr(win, 5, 2, "Waiting for process samples...", cols - 4);
+  }
+
+  const std::string footer = " j/k:Navigate  x3:Kill  w:Trust  h:Dashboard  c:Clear  q:Quit   * trusted ";
+  wattron(win, A_REVERSE);
+  mvwaddnstr(win, rows - 1, 0, footer.c_str(), cols);
+  for (int x = std::min(cols, static_cast<int>(footer.size())); x < cols; ++x) mvwaddch(win, rows - 1, x, ' ');
+  wattroff(win, A_REVERSE);
+  drawRuntimeStatus(win, config);
+  wnoutrefresh(win);
 }
 
 void updateHistory(MetricsHistory* history, const Snapshot& snapshot, size_t max_points,
@@ -2849,14 +3400,24 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     return;
   }
 
+  if (config.show_process_history) {
+    renderProcessHistoryView(stdscr, history, config);
+    doupdate();
+    return;
+  }
+
   if (config.zen_mode) {
     renderZenMode(stdscr, snapshot, config, processes, loading);
+    drawRuntimeStatus(stdscr, config);
+    wnoutrefresh(stdscr);
     doupdate();
     return;
   }
 
   if (config.pro_mode) {
     renderProMode(stdscr, snapshot, config, processes, loading);
+    drawRuntimeStatus(stdscr, config);
+    wnoutrefresh(stdscr);
     doupdate();
     return;
   }
@@ -2893,7 +3454,7 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
     mvaddch(1, x, ACS_HLINE);
   }
 
-  std::string shortcuts = " q:Quit  z:Zen  s:Sort  l:Lock  u:Unlock  P:Pro   +/-:Speed  r:Refresh  ?:Help ";
+  std::string shortcuts = " q:Quit  h:History  w:Trust  z:Zen  s:Sort  j/k:Nav  x3:Kill  P:Pro  ?:Help ";
   attron(A_REVERSE);
   mvaddnstr(rows - 1, 0, shortcuts.c_str(), cols);
   attroff(A_REVERSE);
@@ -2958,6 +3519,8 @@ void renderSnapshot(const Snapshot& snapshot, const MetricsHistory& history,
                        config.show_selection_highlight, config.sort_mode);
   }
 
+  drawRuntimeStatus(stdscr, config);
+
   wnoutrefresh(stdscr);
 
   if (cpu_panel) { wnoutrefresh(cpu_panel); delwin(cpu_panel); }
@@ -2990,6 +3553,7 @@ int main(int argc, char* argv[]) {
   }
 
   std::setlocale(LC_ALL, "");
+  loadAlertWhitelist(&config);
 
 
   hmon::core::PluginManager pm;
@@ -3061,9 +3625,14 @@ int main(int argc, char* argv[]) {
   collect_future.wait();
 
   Snapshot snapshot = collectSnapshot(pm, config);
-  std::vector<ProcessInfo> processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
+  std::vector<ProcessInfo> process_candidates;
+  std::vector<ProcessInfo> processes = collectProcesses(
+      pm, config.top_processes, config.sort_mode, config.lock_pid, &process_candidates);
   syncSelection(processes, &config);
   updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+  updateProcessHistory(&history, process_candidates, &config);
+  if (config.show_process_history)
+    moveHistorySelection(history, &config, 0, std::max(1, getmaxy(stdscr) - 5));
   renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms, false);
 
   while (true) {
@@ -3104,6 +3673,52 @@ int main(int argc, char* argv[]) {
 
     if (ch == KEY_RESIZE) {
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'h' || ch == 'H') {
+      config.show_process_history = !config.show_process_history;
+      if (config.show_process_history) {
+        moveHistorySelection(history, &config, 0, std::max(1, getmaxy(stdscr) - 5));
+      }
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.show_process_history && (ch == 'c' || ch == 'C')) {
+      history.processes.clear();
+      history.process_sample = 0;
+      config.resource_alert.clear();
+      setNotice(&config, "Process history cleared.", std::chrono::seconds(2));
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.show_process_history && (ch == KEY_UP || ch == 'k' || ch == 'K')) {
+      moveHistorySelection(history, &config, -1, std::max(1, getmaxy(stdscr) - 5));
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.show_process_history && (ch == KEY_DOWN || ch == 'j' || ch == 'J')) {
+      moveHistorySelection(history, &config, 1, std::max(1, getmaxy(stdscr) - 5));
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.show_process_history && (ch == 'x' || ch == 'X')) {
+      handleKillPress(&config, process_candidates, &history);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (ch == 'w' || ch == 'W') {
+      toggleAlertWhitelist(&config, process_candidates, &history);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
+    if (config.show_process_history && ch != ERR) {
       continue;
     }
 
@@ -3225,18 +3840,30 @@ int main(int argc, char* argv[]) {
       int idx = ch - '1';
       if (idx < static_cast<int>(processes.size())) {
         config.selected_pid = processes[static_cast<size_t>(idx)].pid;
+        config.kill_confirm_pid = -1;
+        config.kill_confirm_presses = 0;
         config.show_selection_highlight = true;
         renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
       }
       continue;
     }
 
+    if (ch == 'x' || ch == 'X') {
+      handleKillPress(&config, process_candidates, &history);
+      renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
+      continue;
+    }
+
     if (ch == 'r' || ch == 'R') {
       pm.collect_all();
       snapshot = collectSnapshot(pm, config);
-      processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
+      processes = collectProcesses(
+          pm, config.top_processes, config.sort_mode, config.lock_pid, &process_candidates);
       syncSelection(processes, &config);
       updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+      updateProcessHistory(&history, process_candidates, &config);
+      if (config.show_process_history)
+        moveHistorySelection(history, &config, 0, std::max(1, getmaxy(stdscr) - 5));
       renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
       continue;
     }
@@ -3265,9 +3892,13 @@ int main(int argc, char* argv[]) {
 
     pm.collect_all();
     snapshot = collectSnapshot(pm, config);
-    processes = collectProcesses(pm, config.top_processes, config.sort_mode, config.lock_pid);
+    processes = collectProcesses(
+        pm, config.top_processes, config.sort_mode, config.lock_pid, &process_candidates);
     syncSelection(processes, &config);
     updateHistory(&history, snapshot, config.history_points, computeRootDiskBusyPercent());
+    updateProcessHistory(&history, process_candidates, &config);
+    if (config.show_process_history)
+      moveHistorySelection(history, &config, 0, std::max(1, getmaxy(stdscr) - 5));
     renderSnapshot(snapshot, history, processes, host, config, refresh_interval_ms);
   }
 

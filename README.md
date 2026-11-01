@@ -24,7 +24,8 @@
 - **Memory** — usage, buffers, cache, slab, swap, detailed `/proc/meminfo` breakdown
 - **Disk** — space usage, per-device I/O throughput and busy %
 - **Network** — interface throughput (RX/TX), TCP connection states
-- **Processes** — top processes sorted by CPU, memory, GPU, or PID
+- **Processes** — top processes plus a highest-usage-first history covering only the last 60 seconds
+- **Sustained-use alerts** — gives a quiet warning after a non-trusted process stays above a resource limit for 15 seconds
 - **Docker** — container status, CPU/memory per container
 - **Ports** — listening ports with bound process
 - **Services** — systemd unit status
@@ -129,11 +130,18 @@ hmon [OPTIONS]
 | `s` | Cycle sort (CPU → MEM → GPU → PID) |
 | `j` / `k` / `↑` / `↓` | Navigate process list |
 | `1`–`9` | Jump to process row |
+| `h` | Open/close the ranked 60-second process history |
+| `c` | Clear process history while history view is open |
+| `w` | Trust/untrust the selected process for alerts |
 | `l` | Lock/unlock selected PID |
 | `u` | Unlock PID |
+| `x` three times | Send `SIGTERM` to the selected process (within 3 seconds) |
 | `r` | Force refresh |
 | `+` / `-` | Increase/decrease refresh speed |
 | `Tab` | Cycle focus (zen mode) |
+
+Trusted process names persist in `$XDG_CONFIG_HOME/hmon/whitelist`, or `~/.config/hmon/whitelist`.
+In history view, use `j`/`k` to select ranked rows and press `x` three times to send `SIGTERM`.
 
 ---
 

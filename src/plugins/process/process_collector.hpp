@@ -7,7 +7,7 @@
 
 namespace hmon::plugins::process {
 
-enum class SortMode { kCpu, kMem, kGpu, kPid };
+enum class SortMode { kCpu, kMem, kGpu, kPid, kResourceCandidates };
 
 struct ProcessEntry {
     int pid = 0;
