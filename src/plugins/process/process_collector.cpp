@@ -301,6 +301,31 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
     }
 
     switch (sort_mode) {
+        case SortMode::kResourceCandidates: {
+            std::vector<ProcessEntry> candidates;
+            auto add_top = [&](auto compare) {
+                auto sorted = result;
+                std::stable_sort(sorted.begin(), sorted.end(), compare);
+                const size_t count = std::min(limit, sorted.size());
+                for (size_t i = 0; i < count; ++i) {
+                    const auto exists = std::find_if(candidates.begin(), candidates.end(),
+                        [&](const ProcessEntry& entry) { return entry.pid == sorted[i].pid; });
+                    if (exists == candidates.end()) candidates.push_back(std::move(sorted[i]));
+                }
+            };
+            add_top([](const ProcessEntry& a, const ProcessEntry& b) {
+                return a.cpu_percent > b.cpu_percent;
+            });
+            add_top([](const ProcessEntry& a, const ProcessEntry& b) {
+                return a.mem_percent > b.mem_percent;
+            });
+            add_top([](const ProcessEntry& a, const ProcessEntry& b) {
+                return a.gpu_percent > b.gpu_percent;
+            });
+            add_top([](const ProcessEntry& a, const ProcessEntry& b) { return a.pid < b.pid; });
+            result = std::move(candidates);
+            break;
+        }
         case SortMode::kGpu:
             std::stable_sort(result.begin(), result.end(),
                              [](const ProcessEntry& a, const ProcessEntry& b) { return a.gpu_percent > b.gpu_percent; });
@@ -319,7 +344,7 @@ std::vector<ProcessEntry> collectTopProcesses(ProcessPluginCtx* ctx, size_t limi
             break;
     }
 
-    if (result.size() > limit) result.resize(limit);
+    if (sort_mode != SortMode::kResourceCandidates && result.size() > limit) result.resize(limit);
 
     if (ctx) {
         ctx->prev_utime.clear();

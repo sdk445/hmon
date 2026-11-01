@@ -39,7 +39,8 @@ static void appendMetric(hmon_metric_list* list, const char* key, int type, cons
 static int process_plugin_collect(hmon_plugin_ctx* ctx, hmon_metric_list* out_list) {
     if (!ctx || !out_list) return -1;
     auto* c = reinterpret_cast<hmon::plugins::process::ProcessPluginCtx*>(ctx);
-    auto procs = hmon::plugins::process::collectTopProcesses(c, 20, c->sort_mode, c->lock_pid);
+    auto procs = hmon::plugins::process::collectTopProcesses(
+        c, 20, hmon::plugins::process::SortMode::kResourceCandidates, c->lock_pid);
     for (size_t i = 0; i < procs.size(); ++i) {
         const auto& p = procs[i];
         char key[128];
